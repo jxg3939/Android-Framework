@@ -22,7 +22,7 @@ mScheduler->createEventThread(scheduler::Cycle::LastComposite,
 实际EventThread的创建情况以项目为准，联想A17的项目中还保留A14返回ConnectionHandle的形式，后面内容以android-17.0.0_r1为参考
 
 ```cpp
-
+// 注意的是这里的getVsyncSchedule()不带displayid返回的是PacesetterDisplay的VsyncSchedule
 // android-17.0.0_r1中就只有app一个了
 void Scheduler::createEventThread(TokenManager* tokenManager, std::chrono::nanoseconds workDuration,
                                   std::chrono::nanoseconds readyDuration) {
@@ -47,7 +47,6 @@ void Scheduler::createEventThread(Cycle cycle, frametimeline::TokenManager* toke
 }
 ```
 
-
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/EventThread.cpp
 EventThread::EventThread(const char* name, std::shared_ptr<scheduler::VsyncSchedule> vsyncSchedule,
@@ -61,6 +60,7 @@ EventThread::EventThread(const char* name, std::shared_ptr<scheduler::VsyncSched
         mWorkDuration(base::StringPrintf("VsyncWorkDuration-%s", name), workDuration),
         mReadyDuration(readyDuration),
         mVsyncSchedule(std::move(vsyncSchedule)),
+        // 这里createDispatchCallback()创建的callback最终是落到VSyncDispatchTimerQueueEntry的callback
         mVsyncRegistration(mVsyncSchedule->getDispatch(), createDispatchCallback(), name),
         mTokenManager(tokenManager),
         mCallback(callback) {
@@ -69,9 +69,7 @@ EventThread::EventThread(const char* name, std::shared_ptr<scheduler::VsyncSched
         std::unique_lock<std::mutex> lock(mMutex);
         threadMain(lock);
     });
-
     pthread_setname_np(mThread.native_handle(), mThreadName);
-
     pid_t tid = pthread_gettid_np(mThread.native_handle());
     // Use SCHED_FIFO to minimize jitter
     constexpr int EVENT_THREAD_PRIORITY = 2;
@@ -81,6 +79,46 @@ EventThread::EventThread(const char* name, std::shared_ptr<scheduler::VsyncSched
         ALOGE("Couldn't set SCHED_FIFO for EventThread");
     }
     set_sched_policy(tid, SP_FOREGROUND);
+}
+```
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/EventThread.cpp
+scheduler::VSyncDispatch::Callback EventThread::createDispatchCallback() {
+    return [this](nsecs_t vsyncTime, nsecs_t wakeupTime, nsecs_t readyTime) {
+        onVsync(vsyncTime, wakeupTime, readyTime);
+    };
+}
+
+void EventThread::onVsync(nsecs_t vsyncTime, nsecs_t wakeupTime, nsecs_t readyTime) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    mLastVsyncCallbackTime = TimePoint::fromNs(vsyncTime);
+    LOG_FATAL_IF(!mVSyncState);
+    // Perftto中Vsync-app信号翻转
+    mVsyncTracer = (mVsyncTracer + 1) % 2;
+    // mPendingEvents中push了Vsync事件
+    mPendingEvents.push_back(makeVSync(mVsyncSchedule->getPhysicalDisplayId(), wakeupTime,
+                                       ++mVSyncState->count, vsyncTime, readyTime));
+    mCondition.notify_all();
+}
+
+DisplayEventReceiver::Event makeVSync(PhysicalDisplayId displayId, nsecs_t timestamp,
+                                      uint32_t count, nsecs_t expectedPresentationTime,
+                                      nsecs_t deadlineTimestamp) {
+    DisplayEventReceiver::Event event;
+    // 事件类型DISPLAY_EVENT_VSYNC
+    event.header = {DisplayEventType::DISPLAY_EVENT_VSYNC, displayId, timestamp};
+    // Vsync序号
+    event.vsync.count = count;
+    event.vsync.vsyncData.preferredFrameTimelineIndex = 0;
+    // Temporarily store the current vsync information in frameTimelines[0], marked as
+    // platform-preferred. When the event is dispatched later, the frame interval at that time is
+    // used with this information to generate multiple frame timeline choices.
+    event.vsync.vsyncData.frameTimelines[0] = {.vsyncId = FrameTimelineInfo::INVALID_VSYNC_ID,
+                                               .deadlineTimestamp = deadlineTimestamp,
+                                               .expectedPresentationTime =
+                                                       expectedPresentationTime};
+    return event;
 }
 ```
 
