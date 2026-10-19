@@ -543,3 +543,244 @@ ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTim
     return ScheduleResult{TimePoint::fromNs(nextWakeupTime), TimePoint::fromNs(nextVsyncTime)};
 }
 ```
+
+### 3.3.5 Timer
+
+Timer在VSyncDispatchTimerQueue构造时完成初始化
+
+```cpp
+VSyncDispatchTimerQueue::VSyncDispatchTimerQueue(std::unique_ptr<TimeKeeper> tk,
+                                                VsyncSchedule::TrackerPtr tracker,
+                                                nsecs_t timerSlack, nsecs_t minVsyncDistance)
+```
+
+Timer事件驱动机制：
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/src/Timer.cpp
+Timer::Timer() {
+    reset();
+    mDispatchThread = std::thread([this]() { threadMain(); });
+}
+
+void Timer::threadMain() {
+    while (dispatch()) {
+        reset();
+    }
+}
+
+bool Timer::dispatch() {
+    setDebugState(DebugState::Running);
+    struct sched_param param = {0};
+    param.sched_priority = 2;
+    ...
+    enum DispatchType : uint32_t { TIMER, TERMINATE, MAX_DISPATCH_TYPE };
+    ...
+    uint64_t iteration = 0;
+    while (true) {
+        setDebugState(DebugState::Waiting);
+        epoll_event events[DispatchType::MAX_DISPATCH_TYPE];
+        // 直到监听的文件描述符出现事件或发生错误
+        int nfds = epoll_wait(mEpollFd, events, DispatchType::MAX_DISPATCH_TYPE, -1);
+        ...
+        for (auto i = 0; i < nfds; i++) {
+            if (events[i].data.u32 == DispatchType::TIMER) {
+                static uint64_t mIgnored = 0;
+                setDebugState(DebugState::Reading);
+                read(mTimerFd, &mIgnored, sizeof(mIgnored));
+                setDebugState(DebugState::Running);
+                std::function<void()> cb;
+                {
+                    std::lock_guard lock(mMutex);
+                    cb = mCallback;
+                    mExpectingCallback = false;
+                }
+                if (cb) {
+                    // 执行VSyncDispatchTimerQueue::timerCallback回调
+                    setDebugState(DebugState::InCallback);
+                    cb();
+                    setDebugState(DebugState::Running);
+                }
+            }
+            if (events[i].data.u32 == DispatchType::TERMINATE) {
+                ALOGE("Terminated");
+                setDebugState(DebugState::Running);
+                return false;
+            }
+        }
+    }
+}
+
+void Timer::reset() {
+    std::function<void()> cb;
+    {
+        std::lock_guard lock(mMutex);
+        // reset时不丢掉一个待执行的VSyncDispatchTimerQueue::timerCallback
+        if (mExpectingCallback && mCallback) {
+            cb = mCallback;
+        }
+        cleanup();
+        mTimerFd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        mEpollFd = epoll_create1(EPOLL_CLOEXEC);
+        if (pipe2(mPipes.data(), O_CLOEXEC | O_NONBLOCK)) {
+            ALOGE("could not create TimerDispatch mPipes");
+        }
+    }
+    if (cb) {
+        setDebugState(DebugState::InCallback);
+        cb();
+        setDebugState(DebugState::Running);
+    }
+    setDebugState(DebugState::Reset);
+}
+```
+
+与VsyncDispatch交互核心：
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/src/Timer.cpp
+void Timer::alarmAt(std::function<void()> callback, nsecs_t time) {
+    std::lock_guard lock(mMutex);
+    using namespace std::literals;C
+    static constexpr int ns_per_s =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count();
+    // 设置mCallback  供dispatch中驱动执行
+    setCallback(std::move(callback));
+    struct itimerspec old_timer;
+    // 计算触发时间
+    struct itimerspec new_timer {
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0},
+        .it_value = {.tv_sec = static_cast<long>(time / ns_per_s),
+                     .tv_nsec = static_cast<long>(time % ns_per_s)},
+    };
+    // 设置到点触发
+    if (timerfd_settime(mTimerFd, TFD_TIMER_ABSTIME, &new_timer, &old_timer)) {
+        ALOGW("Failed to set timerfd %s (%i)", strerror(errno), errno);
+    }
+}
+
+void Timer::alarmCancel() {
+    std::lock_guard lock(mMutex);
+    struct itimerspec old_timer;
+    // 立即触发
+    struct itimerspec new_timer {
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0},
+        .it_value = {
+                .tv_sec = 0,
+                .tv_nsec = 0,
+        },
+    };
+    if (timerfd_settime(mTimerFd, 0, &new_timer, &old_timer)) {
+        ALOGW("Failed to disarm timerfd");
+    }
+    // 这里把mCallback置空时持有锁，dispatch中在获取mCallback以及alarmAt中设置Callback时也是要锁的，不会冲突
+    setCallback({});
+}
+```
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
+void VSyncDispatchTimerQueue::cancelTimer() {
+    mIntendedWakeupTime = kInvalidTime;
+    mTimeKeeper->alarmCancel();
+}
+
+// 设置一个定时醒来的任务  这个函数都是在rearmTimerSkippingUpdateFor中调用
+void VSyncDispatchTimerQueue::setTimer(nsecs_t targetTime, nsecs_t /*now*/) {
+    mIntendedWakeupTime = targetTime;
+    mTimeKeeper->alarmAt(std::bind(&VSyncDispatchTimerQueue::timerCallback, this), mIntendedWakeupTime);
+    mLastTimerSchedule = mTimeKeeper->now();
+}
+
+void VSyncDispatchTimerQueue::rearmTimer(nsecs_t now) {
+    rearmTimerSkippingUpdateFor(now, mCallbacks.cend());
+}
+
+void VSyncDispatchTimerQueue::rearmTimerSkippingUpdateFor(nsecs_t now, CallbackMap::const_iterator skipUpdateIt) {
+    SFTRACE_CALL();
+    std::optional<nsecs_t> min;
+    std::optional<nsecs_t> targetVsync;
+    std::optional<std::string_view> nextWakeupName;
+    for (auto it = mCallbacks.cbegin(); it != mCallbacks.cend(); ++it) {
+        auto& callback = it->second;
+        // 过滤不需要处理的Entry
+        // 1.wakeupTime()没有值，即Entry没有计划的唤醒时间；2.没有被addPendingWorkload
+        if (!callback->wakeupTime() && !callback->hasPendingWorkloadUpdate()) {
+            continue;
+        }
+        // 这个callback是要rearm的那个，就不update
+        if (it != skipUpdateIt) {
+            // 更新这个callback的arminfo
+            callback->update(*mTracker, now);
+        }
+        traceEntry(*callback, now);
+        const auto wakeupTime = *callback->wakeupTime();
+        // 取最小的wakeuptime
+        if (!min || *min > wakeupTime) {
+            nextWakeupName = callback->name();
+            min = wakeupTime;
+            targetVsync = callback->targetVsync();
+        }
+    }
+    if (min && min < mIntendedWakeupTime) {
+        setTimer(*min, now);
+    } else { // 有可能其他所有callback的wakeuptime都没有mIntendedWakeupTime早 取消掉这次Timer的wakeup
+        SFTRACE_NAME("cancel timer");
+        cancelTimer();
+    }
+}
+
+void VSyncDispatchTimerQueue::timerCallback() {
+    SFTRACE_CALL();
+    struct Invocation {
+        std::shared_ptr<VSyncDispatchTimerQueueEntry> callback;
+        nsecs_t vsyncTimestamp;
+        nsecs_t wakeupTimestamp;
+        nsecs_t deadlineTimestamp;
+    };
+    std::vector<Invocation> invocations;
+    {
+        std::lock_guard lock(mMutex);
+        if (!mRunning) {
+            ALOGD("TimerQueue is not running. Skipping callback.");
+            return;
+        }
+        auto const now = mTimeKeeper->now();
+        mLastTimerCallback = now;
+        for (auto it = mCallbacks.begin(); it != mCallbacks.end(); it++) {
+            auto& callback = it->second;
+            // mArmedInfo->mActualWakeupTime
+            auto const wakeupTime = callback->wakeupTime();
+            if (!wakeupTime) {
+                continue;
+            }
+            traceEntry(*callback, now);
+            // mArmedInfo->mActualReadyTime
+            auto const readyTime = callback->readyTime();
+            // 相对计划晚了多少
+            auto const lagAllowance = std::max(now - mIntendedWakeupTime, static_cast<nsecs_t>(0));
+            if (*wakeupTime < mIntendedWakeupTime + mTimerSlack + lagAllowance) {
+                // 锁内标记执行
+                // nsecs_t VSyncDispatchTimerQueueEntry::executing() {
+                    // mLastDispatchTime = mArmedInfo->mActualVsyncTime;
+                    // disarm();
+                    // return *mLastDispatchTime;
+                    // }
+                callback->executing();
+                // callback->lastExecutedVsyncTarget()返回mLastDispatchTime
+                invocations.emplace_back(Invocation{callback, *callback->lastExecutedVsyncTarget(),
+                                                    *wakeupTime, *readyTime});
+            }
+        }
+        mIntendedWakeupTime = kInvalidTime;
+        rearmTimer(mTimeKeeper->now());
+    }
+    // 锁外实际执行所有entry内部的callback
+    for (auto const& invocation : invocations) {
+        ftl::Concat trace(ftl::truncated<5>(invocation.callback->name()));
+        SFTRACE_FORMAT("%s: %s", __func__, trace.c_str());
+        invocation.callback->callback(invocation.vsyncTimestamp, invocation.wakeupTimestamp,
+                                      invocation.deadlineTimestamp);
+    }
+}
+```
