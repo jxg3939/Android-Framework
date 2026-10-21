@@ -46,7 +46,7 @@ public DisplayEventReceiver(Looper looper, int eventRegistration,
     mReceiverPtr = nativeInit(new WeakReference<DisplayEventReceiver>(this),
             new WeakReference<VsyncEventData>(mVsyncEventData),
             mMessageQueue,
-            eventRegistration, layerHandle);
+            eventRegistration /* 0*/, layerHandle /* 0*/);
     ...
 }
 ```
@@ -58,7 +58,7 @@ public DisplayEventReceiver(Looper looper, int eventRegistration,
 static jlong nativeInit(JNIEnv* env, jclass clazz, jobject receiverWeak, jobject vsyncEventDataWeak, jobject messageQueueObj, jint eventRegistration, jlong layerHandle) {
         sp<MessageQueue> messageQueue = android_os_MessageQueue_getMessageQueue(env, messageQueueObj);
         ...
-        // 在这里面真正初始化了DisplayEventReceiver(CPP)
+        // 在这里面真正初始化了NativeDisplayEventReceiver(CPP)
         sp<NativeDisplayEventReceiver> receiver =
                 new NativeDisplayEventReceiver(env, receiverWeak, vsyncEventDataWeak, messageQueue,
                                             eventRegistration, layerHandle);
@@ -137,7 +137,7 @@ DisplayEventReceiver::DisplayEventReceiver(EventRegistrationFlags eventRegistrat
 }
 ```
 
-### 2.3 获取DisplayEventConnection
+### 2.3 跨进程获取DisplayEventConnection
 
 ```cpp
 // frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
@@ -249,8 +249,12 @@ private void scheduleFrameLocked(long now) {
     if (!mFrameScheduled) {
         mFrameScheduled = true;
         ...
-        if (isRunningOnLooperThreadLocked()) {
-            scheduleVsyncLocked(); 
+        if (USE_VSYNC) {
+            ...
+            if (isRunningOnLooperThreadLocked()) {
+                scheduleVsyncLocked(); 
+                ...
+            }
             ...
         }
         ...

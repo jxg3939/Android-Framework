@@ -177,7 +177,6 @@ VsyncSchedule::ControllerPtr VsyncSchedule::createController(PhysicalDisplayId i
 }
 ```
 
-
 #### 1.2.2 VsyncSchedule初始化完成后注册Display
 
 ```cpp

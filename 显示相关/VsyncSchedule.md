@@ -185,6 +185,7 @@ bool VSyncReactor::addPresentFence(std::shared_ptr<FenceTime> fence) {
 ```
 
 喂HwVsync信号
+
 ```cpp
 bool VSyncReactor::addHwVsyncTimestamp(nsecs_t timestamp, std::optional<nsecs_t> hwcVsyncPeriod,
                                        bool* periodFlushed, VSyncTracker::VsyncTimeSource source) {
@@ -235,7 +236,6 @@ bool VSyncReactor::addVsyncTimestampLocked(nsecs_t timestamp,
 ```
 
 ### 3.3 VsyncDispatch
-
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatch.h
