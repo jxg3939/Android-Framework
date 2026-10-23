@@ -4,6 +4,8 @@ VsyncSchedule是Scheduler下一个针对单个物理显示器的、完整的VSyn
 
 ## 1 Scheduler初始化
 
+<a id="scheduler初始化"></a>
+
 根据当前物理显示屏的刷新能力和系统配置，创建并初始化Scheduler，注册显示屏、建立VSync事件分发机制，最后启动定时器
 
 ```cpp
@@ -78,6 +80,9 @@ void SurfaceFlinger::initScheduler(const sp<const DisplayDevice>& display) {
     mScheduler->startTimers();
 }
 ```
+[mScheduler->registerDisplay](#12-注册单个显示器Display)
+[mScheduler->createEventThread](./EventThread.md#createEventThread)
+[mScheduler->initVsync](#initVsync)
 
 在以上Scheduler的初始化过程中，有几个重要的调用
 
@@ -101,19 +106,22 @@ Scheduler::Scheduler(ICompositor& compositor, ISchedulerCallback& callback, Feat
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
+// 该函数的主要职责就是创建一个VsyncSchedule，然后注册一个display与之关联绑定
 void Scheduler::registerDisplay(PhysicalDisplayId displayId,
                                 ui::DisplayConnectionType connectionType,
                                 RefreshRateSelectorPtr selectorPtr) {
-    // 第一步，创建VsyncSchedule
+    // 创建VsyncSchedule
     auto schedulePtr = std::make_shared<VsyncSchedule>(selectorPtr->getActiveMode().modePtr, mFeatures,
                                             [this](PhysicalDisplayId id, bool enable) {
                                                 onHardwareVsyncRequest(id, enable);
                                             });
-    // 第二步，注册Display
+    // 注册Display
     registerDisplayInternal(displayId, connectionType, std::move(selectorPtr),
                             std::move(schedulePtr));
 }
 ```
+[`VsyncSchedule`创建](./VsyncSchedule.md#VsyncSchedule创建)
+[`registerDisplayInternal`](#registerDisplayInternal)
 
 #### 1.2.1 VsyncSchedule内的三个重要成员
 
@@ -179,6 +187,8 @@ VsyncSchedule::ControllerPtr VsyncSchedule::createController(PhysicalDisplayId i
 
 #### 1.2.2 VsyncSchedule初始化完成后注册Display
 
+<a id="registerDisplayInternal"></a>
+
 ```cpp
 void Scheduler::registerDisplayInternal(PhysicalDisplayId displayId,
                                         ui::DisplayConnectionType connectionType,
@@ -235,6 +245,8 @@ void Scheduler::createEventThread(TokenManager* tokenManager, std::chrono::nanos
 
 这里面最重要的就是创建mVsync.registration
 它是VSyncDispatch和调用方之间的一个回调句柄，负责注册回调、调度回调、取消回调
+
+<a id="initVsync"></a>
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp

@@ -13,18 +13,20 @@ mScheduler->registerDisplay(displayId, connectionType, display->holdRefreshRateS
 void Scheduler::registerDisplay(PhysicalDisplayId displayId,
                                 ui::DisplayConnectionType connectionType,
                                 RefreshRateSelectorPtr selectorPtr) {
-    // 第一步，创建VsyncSchedule
+    // 创建VsyncSchedule
     auto schedulePtr = std::make_shared<VsyncSchedule>(selectorPtr->getActiveMode().modePtr, mFeatures,
                                             [this](PhysicalDisplayId id, bool enable) {
                                                 onHardwareVsyncRequest(id, enable);
                                             });
-    // 第二步，注册Display
+    // 注册Display
     registerDisplayInternal(displayId, connectionType, std::move(selectorPtr),
                             std::move(schedulePtr));
 }
 ```
 
 ## 2 初始化
+
+<a id="VsyncSchedule创建"></a>
 
 ```cpp
 VsyncSchedule::VsyncSchedule(ftl::NonNull<DisplayModePtr> modePtr, FeatureFlags features,
@@ -129,6 +131,96 @@ public:
 - `nextAnticipatedVSyncTimeFrom`是核心方法:获取下一次预期Vsync时间，dispatch每排一个回调都要用它算唤醒时间。它保证返回的时间`>= timePoint`
 - `lastVsyncOpt`参数是给VRR用的:客户端告诉tracker上次用的Vsync是哪个,tracker据此避免跨过VRR的最小帧周期
 - `setRenderRate`处理屏是120Hz但内容只跑60Hz的情况:tracker继续按120Hz追踪硬件vsync时间线,但`nextAnticipatedVSyncTimeFrom`按60Hz的节奏返回
+
+```cpp
+nsecs_t VSyncPredictor::nextAnticipatedVSyncTimeFrom(nsecs_t timePoint,
+                                                     std::optional<nsecs_t> lastVsyncOpt) {
+    SFTRACE_CALL();
+    std::lock_guard lock(mMutex);
+    const auto now = TimePoint::fromNs(mClock->now());
+    // 
+    purgeTimelines(now);
+    // 保证预测起点不早于已发生的VSync
+    if (lastVsyncOpt && *lastVsyncOpt > timePoint) {
+        timePoint = *lastVsyncOpt;
+    }
+    const auto model = getVSyncPredictionModelLocked();
+    const auto threshold = model.slope / 2;
+    std::optional<Period> minFramePeriodOpt;
+    // 一帧需要多个周期
+    if (mNumVsyncsForFrame > 1) {
+        minFramePeriodOpt = minFramePeriodLocked();
+    }
+    std::optional<TimePoint> vsyncOpt;
+    // 遍历mTimelines 找第一个可用预测
+    for (auto& timeline : mTimelines) {
+        vsyncOpt = timeline.nextAnticipatedVSyncTimeFrom(model, minFramePeriodOpt,
+                    snapToVsync(timePoint), mMissedVsync, 
+                    lastVsyncOpt ? snapToVsync(*lastVsyncOpt - threshold): lastVsyncOpt);
+        if (vsyncOpt) {
+            break;
+        }
+    }
+    LOG_ALWAYS_FATAL_IF(!vsyncOpt);
+    // 如果本次预测的Vsync时间大于目前已经承诺过的最大Vsync时间，则更新
+    if (*vsyncOpt > mLastCommittedVsync) {
+        mLastCommittedVsync = *vsyncOpt;
+        SFTRACE_FORMAT_INSTANT("mLastCommittedVsync in %.2fms",
+                               float(mLastCommittedVsync.ns() - mClock->now()) / 1e6f);
+    }
+    return vsyncOpt->ns();
+}
+```
+
+```cpp
+std::optional<TimePoint> VSyncPredictor::VsyncTimeline::nextAnticipatedVSyncTimeFrom(
+        Model model, std::optional<Period> minFramePeriodOpt, nsecs_t vsync,
+        MissedVsync missedVsync, std::optional<nsecs_t> lastVsyncOpt) {
+    if (CC_UNLIKELY(SFTRACE_ENABLED())) {
+        SFTRACE_FORMAT("renderRate %s", mRenderRateOpt ? to_string(*mRenderRateOpt).c_str() : "NA");
+    }
+    nsecs_t vsyncTime = snapToVsyncAlignedWithRenderRate(model, vsync);
+    const auto threshold = model.slope / 2;
+    const auto lastFrameMissed =
+            lastVsyncOpt && std::abs(*lastVsyncOpt - missedVsync.vsync.ns()) < threshold;
+    const auto mightBackpressure = minFramePeriodOpt && mRenderRateOpt &&
+            mRenderRateOpt->getPeriod() < 2 * (*minFramePeriodOpt);
+    if (lastFrameMissed) {
+        // If the last frame missed is the last vsync, we already shifted the timeline. Depends
+        // on whether we skipped the frame (onFrameMissed) or not (onFrameBegin) we apply a
+        // different fixup if we are violating the minFramePeriod.
+        // There is no need to shift the vsync timeline again.
+        if (vsyncTime - missedVsync.vsync.ns() < minFramePeriodOpt->ns()) {
+            vsyncTime += missedVsync.fixup.ns();
+            SFTRACE_FORMAT_INSTANT("lastFrameMissed");
+        }
+    } else if (mightBackpressure && lastVsyncOpt) {
+        const auto vsyncDiff = vsyncTime - *lastVsyncOpt;
+        if (vsyncDiff <= minFramePeriodOpt->ns() - threshold) {
+            // avoid a duplicate vsync
+            SFTRACE_FORMAT_INSTANT("skipping a vsync to avoid duplicate frame. next in %.2f "
+                                   "which "
+                                   "is %.2f "
+                                   "from "
+                                   "prev. "
+                                   "adjust by %.2f",
+                                   static_cast<float>(vsyncTime - TimePoint::now().ns()) / 1e6f,
+                                   static_cast<float>(vsyncDiff) / 1e6f,
+                                   static_cast<float>(mRenderRateOpt->getPeriodNsecs()) / 1e6f);
+            vsyncTime += mRenderRateOpt->getPeriodNsecs();
+        }
+    }
+
+    SFTRACE_FORMAT_INSTANT("vsync in %.2fms", float(vsyncTime - TimePoint::now().ns()) / 1e6f);
+    if (isWithin(TimePoint::fromNs(vsyncTime)) == VsyncOnTimeline::Outside) {
+        SFTRACE_FORMAT_INSTANT("no longer valid for vsync in %.2f",
+                               static_cast<float>(vsyncTime - TimePoint::now().ns()) / 1e6f);
+        return std::nullopt;
+    }
+
+    return TimePoint::fromNs(vsyncTime);
+}
+```
 
 ### 3.2 VsyncController
 
@@ -256,7 +348,9 @@ public:
 };
 ```
 
-### 3.3.1 两个重要的结构
+### 3.3.1 三个重要的结构
+
+1. ScheduleTiming
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatch.h
@@ -273,6 +367,51 @@ struct ScheduleTiming {
 
 - **内部**消费方(如`"sf"`):`readyDuration = 0`,因为不需要给SF自己额外预留buffer处理时间。
 - **外部**消费方(如`"app"`):`readyDuration = sfWorkDuration`,因为app的buffer要经过SF处理,得把SF的处理时间也算进端到端预算,才能给app一个合理的deadline。
+
+2. VSyncCallbackRegistration
+本质是VsyncDispatch的代理类
+内部持有
+    `std::shared_ptr<VSyncDispatch> mDispatch`和
+    `std::optional<VSyncDispatch::CallbackToken> mToken`
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
+VSyncCallbackRegistration::VSyncCallbackRegistration(std::shared_ptr<VSyncDispatch> dispatch,
+                                                     VSyncDispatch::Callback callback,
+                                                     std::string callbackName)
+      : mDispatch(std::move(dispatch)),
+        mToken(mDispatch->registerCallback(std::move(callback), std::move(callbackName))) {}
+
+VSyncCallbackRegistration::VSyncCallbackRegistration(VSyncCallbackRegistration&& other)
+      : mDispatch(std::move(other.mDispatch)), mToken(std::exchange(other.mToken, std::nullopt)) {}
+
+
+// 内部的三个方法都是用自己绑定的mToken（由一个VsyncDispatchTimerQueueEntry生成）传递给VsyncDispatch
+std::optional<ScheduleResult> VSyncCallbackRegistration::schedule(
+        VSyncDispatch::ScheduleTiming scheduleTiming) {
+    if (!mToken) {
+        return std::nullopt;
+    }
+    return mDispatch->schedule(*mToken, scheduleTiming);
+}
+
+std::optional<ScheduleResult> VSyncCallbackRegistration::update(
+        VSyncDispatch::ScheduleTiming scheduleTiming) {
+    if (!mToken) {
+        return std::nullopt;
+    }
+    return mDispatch->update(*mToken, scheduleTiming);
+}
+
+CancelResult VSyncCallbackRegistration::cancel() {
+    if (!mToken) {
+        return CancelResult::Error;
+    }
+    return mDispatch->cancel(*mToken);
+}
+```
+
+3. VSyncDispatchTimerQueueEntry
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.h

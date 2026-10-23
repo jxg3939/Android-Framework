@@ -5,11 +5,13 @@
 ```cpp
 
 // android-17.0.0_r1
+// frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
 mScheduler->createEventThread(mFrameTimeline->getTokenManager(),
                                 /* workDuration */ configs.late.appWorkDuration,
                                 /* readyDuration */ configs.late.sfWorkDuration);
 
 // android-16.0.0_r1
+// frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
 mScheduler->createEventThread(scheduler::Cycle::Render, mFrameTimeline->getTokenManager(),
                                 /* workDuration */ configs.late.appWorkDuration,
                                 /* readyDuration */ configs.late.sfWorkDuration);
@@ -24,6 +26,8 @@ mScheduler->createEventThread(scheduler::Cycle::LastComposite,
 ```cpp
 // 注意的是这里的getVsyncSchedule()不带displayid返回的是PacesetterDisplay的VsyncSchedule
 // android-17.0.0_r1中就只有app一个了
+// frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
+<a id="createEventThread"></a>
 void Scheduler::createEventThread(TokenManager* tokenManager, std::chrono::nanoseconds workDuration,
                                   std::chrono::nanoseconds readyDuration) {
     mEventThread =
@@ -32,6 +36,7 @@ void Scheduler::createEventThread(TokenManager* tokenManager, std::chrono::nanos
 }
 
 // android-16.0.0_r1中还会根据cycle类型创建两个
+// frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
 void Scheduler::createEventThread(Cycle cycle, frametimeline::TokenManager* tokenManager,
                                   std::chrono::nanoseconds workDuration,
                                   std::chrono::nanoseconds readyDuration) {
@@ -141,9 +146,11 @@ void EventThread::threadMain(std::unique_lock<std::mutex>& lock) {
             if (event->header.type == DisplayEventType::DISPLAY_EVENT_HOTPLUG) {
                 if (event->hotplug.connectionError == 0) {
                     if (event->hotplug.connected && !mVSyncState) {
+                        // 按默认值创建一个新的 count=0 synthetic=false omitted=false
                         mVSyncState.emplace();
                     } else if (!event->hotplug.connected &&
                                mVsyncSchedule->getPhysicalDisplayId() == event->header.displayId) {
+                        // 显示断开时置空
                         mVSyncState.reset();
                     }
                 } else {
@@ -152,14 +159,14 @@ void EventThread::threadMain(std::unique_lock<std::mutex>& lock) {
             }
         }
         bool vsyncRequested = false;
-        // 找出该消费此事件的连接（给consumer）
+        // 找出该消费此事件的连接
         auto it = mDisplayEventConnections.begin();
         while (it != mDisplayEventConnections.end()) {
             if (const auto connection = it->promote()) {
                 if (event && shouldConsumeEvent(*event, connection)) {
                     consumers.push_back(connection);
                 }
-                // 对应连接是否真的请求Vsync
+                // 这里的逻辑是所有的DisplayEventConnection有没有一个真的请求Vsync
                 vsyncRequested |= connection->vsyncRequest != VSyncRequest::None;
                 ++it;
             } else {
@@ -167,7 +174,7 @@ void EventThread::threadMain(std::unique_lock<std::mutex>& lock) {
                 it = mDisplayEventConnections.erase(it);
             }
         }
-        // 分发事件
+        // 分发事件给所有shouldConsumeEvent的DisplayEventConnection
         if (!consumers.empty()) {
             dispatchEvent(*event, consumers);
             consumers.clear();
@@ -208,9 +215,9 @@ void EventThread::threadMain(std::unique_lock<std::mutex>& lock) {
         if (mState == State::Idle) {
             mCondition.wait(lock);
         } else {
-            // 能走到这代表还是要等待Vsync事件，或者自己生成fake Vsync事件
-            // 处于SyntheticVSync状态，等待最多16ms，超时后生成fake Vsync。
+            // 能走到这代表还是要等待Vsync事件(mState == State::VSync)，或者自己生成fake Vsync事件(mState == State::SyntheticVSync)
             // 处于VSync状态，等待最多1000ms内发送Vsync信号，超时后生成fake Vsync兜底
+            // 处于SyntheticVSync状态，等待最多16ms，超时后生成fake Vsync
             const std::chrono::nanoseconds timeout = mState == State::SyntheticVSync ? 16ms : 1000ms;
             if (mCondition.wait_for(lock, timeout) == std::cv_status::timeout) {
                  // 正常Vsync模式下长时间没有收到事件，可能是驱动停滞
@@ -247,7 +254,7 @@ void EventThread::dispatchEvent(const DisplayEventReceiver::Event& event,
             generateFrameTimeline(copy.vsync.vsyncData, frameInterval.ns(), copy.header.timestamp,
                                   event.vsync.vsyncData.preferredExpectedPresentationTime(),
                                   event.vsync.vsyncData.preferredDeadlineTimestamp());
-        }  
+        }
         switch (consumer->postEvent(copy)) {
             case NO_ERROR:
                 break;
@@ -276,7 +283,7 @@ status_t EventThreadConnection::postEvent(const DisplayEventReceiver::Event& eve
         return size < 0 ? status_t(size) : status_t(NO_ERROR);
     };
     // 帧率重写和帧率重写刷新事件重新放回mPendingEvents中下一次处理
-    // 注意这里的mPendingEvents是EventThreadConnection
+    // 注意这里的mPendingEvents是EventThreadConnection的 不是EventThread的
     switch (event.header.type) {
         case DisplayEventType::DISPLAY_EVENT_FRAME_RATE_OVERRIDE:
             [[fallthrough]];
