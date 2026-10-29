@@ -95,7 +95,7 @@ private final class FrameDisplayEventReceiver extends DisplayEventReceiver imple
     FrameDisplayEventReceiver(Looper looper, long layerHandle) {
         super(looper, /* eventRegistration */ 0, layerHandle);
     }
-    // 这个就是Choreographer在收到VSYNC-app信号后的回调
+    // 这个就是FrameDisplayEventReceiver在收到VSYNC-app信号后的回调
     @Override
     public void onVsync(long timestampNanos, long physicalDisplayId, int frame, VsyncEventData vsyncEventData) {
         ...

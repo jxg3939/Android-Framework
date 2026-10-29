@@ -81,7 +81,7 @@ void SurfaceFlinger::initScheduler(const sp<const DisplayDevice>& display) {
 }
 ```
 [mScheduler->registerDisplay](#12-注册单个显示器Display)
-[mScheduler->createEventThread](./EventThread.md#createEventThread)
+[mScheduler->createEventThread](../EventThread相关/EventThread.md#createEventThread)
 [mScheduler->initVsync](#initVsync)
 
 在以上Scheduler的初始化过程中，有几个重要的调用
@@ -120,7 +120,7 @@ void Scheduler::registerDisplay(PhysicalDisplayId displayId,
                             std::move(schedulePtr));
 }
 ```
-[`VsyncSchedule`创建](./VsyncSchedule.md#VsyncSchedule创建)
+[`VsyncSchedule`创建](../VsyncSchedule相关/VsyncSchedule.md#VsyncSchedule创建)
 [`registerDisplayInternal`](#registerDisplayInternal)
 
 #### 1.2.1 VsyncSchedule内的三个重要成员

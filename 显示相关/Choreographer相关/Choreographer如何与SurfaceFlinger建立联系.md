@@ -35,7 +35,7 @@
 mDisplayEventReceiver = USE_VSYNC ? new FrameDisplayEventReceiver(looper, layerHandle) : null;
 ```
 
-**最终是由父类`super(looper, /* eventRegistration */ 0, layerHandle)`进行初始化**
+**最终是由`super(looper, /* eventRegistration */ 0, layerHandle)`进行初始化**
 
 ```java
 // frameworks/base/core/java/android/view/DisplayEventReceiver.java
@@ -73,6 +73,11 @@ static jlong nativeInit(JNIEnv* env, jclass clazz, jobject receiverWeak, jobject
         receiver->incStrong(gDisplayEventReceiverClassInfo.clazz); // retain a reference for the object
         return reinterpret_cast<jlong>(receiver.get());
 }
+```
+
+[关于status_t status = receiver->initialize()](#关于receiver->initialize())
+
+```cpp
 NativeDisplayEventReceiver::NativeDisplayEventReceiver(JNIEnv* env, jobject receiverWeak,
                                                     jobject vsyncEventDataWeak,
                                                     const sp<MessageQueue>& messageQueue,
@@ -195,11 +200,69 @@ sp<EventThreadConnection> EventThread::createEventConnection(EventRegistrationFl
 }
 ```
 
+<a id="关于receiver->initialize()"></a>
+
+```cpp
+// frameworks/native/libs/gui/DisplayEventDispatcher.cpp
+status_t DisplayEventDispatcher::initialize() {
+    status_t result = mReceiver.initCheck();
+    if (result) {
+        ALOGW("Failed to initialize display event receiver, status=%d", result);
+        return result;
+    }
+    // mReceiver是一个DisplayEventReceiver
+    if (mLooper != nullptr) {
+        // 这里getFd()返回的就是DisplayEventReceiver中mDataChannel的BitTube的接收端fd
+        // sp<DisplayEventDispatcher>::fromExisting(this)返回自己作为回调
+        int rc = mLooper->addFd(mReceiver.getFd(), 0, Looper::EVENT_INPUT,
+                                sp<DisplayEventDispatcher>::fromExisting(this), NULL);
+        if (rc < 0) {
+            return UNKNOWN_ERROR;
+        }
+    }
+    return OK;
+}
+```
+
+```cpp
+// DisplayEventDispatcher继承自LooperCallback，所以可以被传到addFd中
+class DisplayEventDispatcher : public LooperCallback {
+public:
+    int handleEvent(int fd, int events, void* data) override;
+    ...
+};
+```
+
+```cpp
+// system/core/libutils/Looper.cpp
+int Looper::addFd(int fd, int ident, int events, const sp<LooperCallback>& callback, void* data) {
+    ...
+    { // acquire lock
+        std::scoped_lock _l(mLock);
+        ...
+        Request request;
+        request.fd = fd;
+        request.ident = ident;
+        request.events = events;
+        request.callback = callback;
+        request.data = data;
+        ...
+        epoll_event eventItem = createEpollEvent(request.getEpollEvents(), seq);
+        ...
+    } // release lock
+    return 1;
+}
+
+```
+
 至此`Choreographer`的成员`mDisplayEventReceiver`(一个继承自DisplayEventReceiver的FrameDisplayEventReceiver对象)初始化完毕，其内部的`NativeDisplayEventReceiver`(Java端持有的CPP指针)对象也初始化完毕，`NativeDisplayEventReceiver`的成员`mReceiver`(CPP端的DisplayEventReceiver)也初始化完毕
 
 ## 3 一次Vsync请求
 
+<a id="scheduleTraversals()">
+
 ### 3.1 APP invalidate()或requestLayout()后 VRI中开始请求Vsync
+
 ```java
 // frameworks/base/core/java/android/view/ViewRootImpl.java
 void scheduleTraversals() {
@@ -219,7 +282,30 @@ void scheduleTraversals() {
 }
 ```
 
+关于回调mTraversalCallback的内容
+
+```java
+// frameworks/base/core/java/android/view/ViewRootImpl.java
+final TraversalCallback mTraversalCallback = new TraversalCallback();
+final class TraversalCallback implements Choreographer.VsyncCallback {
+    @Override
+    public void onVsync(Choreographer.FrameData frameData) {
+        // 遍历整个View树，处理所有需要更新的View
+        doTraversal(frameData.getFrameTimeNanos());
+    }
+}
+void doTraversal(long frameTimeNanos) {
+    if (mTraversalScheduled) {
+        // 这里在performTraversals之前是因为如果在performTraversals时有requestLayout或invalidate来的话可以去预约下一次，而不是被丢掉
+        mTraversalScheduled = false;
+        removeTraversalBarrier(); // 移除同步屏障 performTraversals()可能会发送同步消息，防止死锁
+        performTraversals(frameTimeNanos);
+    }
+}
+```
+
 ### 3.2 交给mChoreographer进行VSYNC请求
+
 ```java
 // frameworks/base/core/java/android/view/Choreographer.java
 public void postVsyncCallback(int callbackType, @NonNull VsyncCallback callback) {

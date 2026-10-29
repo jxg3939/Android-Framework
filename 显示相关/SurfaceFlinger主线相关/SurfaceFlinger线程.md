@@ -112,7 +112,7 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext){
     ...
 }
 ```
-[`initScheduler(display)`](./Scheduler.md#Scheduler初始化)是Scheduler及内部线程的创建点,第4节会展开。到这里可以先得出进程启动的先后:先限binder线程数→起binder池→建RenderEngine→建HWComposer→建Scheduler(含EventThread)→最后`run()`进入主循环。
+[`initScheduler(display)`](../Scheduler相关/Scheduler.md#Scheduler初始化)是Scheduler及内部线程的创建点,第4节会展开。到这里可以先得出进程启动的先后:先限binder线程数→起binder池→建RenderEngine→建HWComposer→建Scheduler(含EventThread)→最后`run()`进入主循环。
 
 ## 2 线程总览
 
