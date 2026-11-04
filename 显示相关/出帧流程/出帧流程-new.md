@@ -24,6 +24,8 @@
 
 ## 第1步：窗口调度下一帧
 
+![alt text](image.png)
+
 ### 1.1 何时触发调度
 
 进入调度的入口有多个，最终都落到`ViewRootImpl.scheduleTraversals()`：
@@ -35,14 +37,16 @@
 - Insets动画：`CALLBACK_INSETS_ANIMATION`阶段更新Insets，随后触发traversal。
 - 窗口变化：`relayoutWindow()`返回新尺寸或Surface，`performTraversals()`内部置位`mFullRedrawNeeded`。
 
-`invalidateChildInParent()`并不遍历View树，它只把脏区域合并进`mDirty`：
+`invalidateChildInParent()`并不遍历View树，它只把脏区域合并进`mDirty`后调`scheduleTraversals()`
 
 ```java
-// frameworks/base/core/java/android/view/ViewRootImpl.java:2917
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 private void invalidateRectOnScreen(Rect dirty) {
     final Rect localDirty = mDirty;
     localDirty.union(dirty.left, dirty.top, dirty.right, dirty.bottom);
+    // 脏区扩张
     final float appScale = mAttachInfo.mApplicationScale;
+    // 是否不在窗口边界内
     final boolean intersected = localDirty.intersect(0, 0,
             (int) (mWidth * appScale + 0.5f), (int) (mHeight * appScale + 0.5f));
     if (!intersected) {
@@ -54,18 +58,39 @@ private void invalidateRectOnScreen(Rect dirty) {
 }
 ```
 
-`requestLayout()`（2842）同样最终落到`scheduleTraversals()`：置`mLayoutRequested = true`后调`scheduleTraversals()`。
+还有VRI中的全局`invalidate()`
+
+```java
+// frameworks/base/core/java/android/view/ViewRootImpl.java
+void invalidate() {
+    mDirty.set(0, 0, mWidth, mHeight);
+    if (!mWillDrawSoon) {
+        scheduleTraversals();
+    }
+}
+```
+
+`requestLayout()`同样最终落到`scheduleTraversals()`，置`mLayoutRequested = true`后调`scheduleTraversals()`。
+
+```java
+// frameworks/base/core/java/android/view/ViewRootImpl.java
+public void requestLayout() {
+    if (!mHandlingLayoutInLayoutRequest) {
+        checkThread();
+        mLayoutRequested = true;
+        scheduleTraversals();
+    }
+}
+```
 
 ### 1.2 scheduleTraversals的合并逻辑
 
 ```java
-// ViewRootImpl.java:3307（节选）
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 void scheduleTraversals() {
     checkThreadCompat();
     if (!mTraversalScheduled) {
         mTraversalScheduled = true;
-        // The following behavior is load-bearing for public API correctness.
-        // ...
         postTraversalBarrier();
         mChoreographer.postVsyncCallback(
                 Choreographer.CALLBACK_TRAVERSAL, mTraversalCallback);
@@ -77,30 +102,27 @@ void scheduleTraversals() {
 
 四个动作：
 
-1. `mTraversalScheduled`标记本帧已调度。同一帧内VRI多次`invalidate()`/`requestLayout()`只有第一个进入if体，修改被合并到同一次`performTraversals()`。
+1. `mTraversalScheduled`标记本帧已调度。同一帧内VRI多次`invalidate()`/`requestLayout()`只有第一个去请求Vsync。
 2. `postTraversalBarrier()`插入同步屏障，只拦同步消息，不拦异步消息。Vsync消息在`onVsync()`里`setAsynchronous(true)`，能越过屏障；屏障保证队列里已有的同步消息不会插到traversal前面。
-3. `postVsyncCallback(CALLBACK_TRAVERSAL, mTraversalCallback)`把实现了`Choreographer.VsyncCallback`的对象挂进Choreographer对应的callback队列，并带上`VSYNC_CALLBACK_TOKEN`。
+3. `postVsyncCallback(CALLBACK_TRAVERSAL, mTraversalCallback)`把`mTraversalCallback`对象挂进Choreographer对应的callback队列。
 4. `notifyRendererOfFramePending()`通知RenderThread即将出帧；`pokeDrawLockIfNeeded()`在息屏/Doze场景短暂持有绘制锁。
-
-`postTraversalBarrier()`（3355）内部调`mQueue.postSyncBarrier()`；`mAtomicTraversalBarrier`为true时再用`mTraversalBarrierAtomic.getAndSet(newBarrier)`原子保存token，若旧token未清就顺手移除，否则写普通成员`mTraversalBarrier`。`removeTraversalBarrier()`（3369）做对称清理。
 
 ### 1.3 doTraversal
 
-`mTraversalCallback`是`TraversalCallback`实例（11445），它收到`FrameData`后只取帧时间：
+`mTraversalCallback`是`TraversalCallback`实例，它收到`FrameData`后只取帧时间：
 
 ```java
-// ViewRootImpl.java:11445
+// frameworks/base/core/java/android/view/ViewRootImpl.java
+final TraversalCallback mTraversalCallback = new TraversalCallback();
+
 final class TraversalCallback implements Choreographer.VsyncCallback {
     @Override
     public void onVsync(Choreographer.FrameData frameData) {
         doTraversal(frameData.getFrameTimeNanos());
     }
 }
-final TraversalCallback mTraversalCallback = new TraversalCallback();
-```
 
-```java
-// ViewRootImpl.java:3347
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 void doTraversal(long frameTimeNanos) {
     if (mTraversalScheduled) {
         mTraversalScheduled = false;
@@ -110,34 +132,50 @@ void doTraversal(long frameTimeNanos) {
 }
 ```
 
-先清标记、移除屏障，再遍历。清标记必须在`performTraversals()`之前：遍历过程中View可能再次`invalidate()`，此时`mTraversalScheduled`已为false，新调度会再插屏障并post一次callback，从而申请下一帧。
-
-### 1.4 与旧资料的差异
-
-`android-17.0.0_r1`的`ViewRootImpl`没有`FrameDisplayEventReceiver`成员，也没有`mDisplayEventReceiver`，更没有`TraversalRunnable`和`postCallback(CALLBACK_TRAVERSAL, mTraversalRunnable)`。当前实现是`postVsyncCallback(CALLBACK_TRAVERSAL, mTraversalCallback)`，回调对象实现`Choreographer.VsyncCallback`，由Choreographer内部的`FrameDisplayEventReceiver`申请并接收Vsync。旧资料“ViewRootImpl用自己的FrameDisplayEventReceiver收Vsync再post”描述的是更早实现。
+先清标记、移除屏障，与`scheduleTraversals()`中一一对应，再遍历。清标记和移除同步屏障在`performTraversals()`之前：`performTraversals()`过程中View可能再次`invalidate()`，此时`mTraversalScheduled`已为false，新调度会再插同步屏障并post一次callback，从而申请下一帧。
 
 ## 第2步：Vsync到达与doFrame
 
+![alt text](image-1.png)
+
 ### 2.1 从postVsyncCallback到申请Vsync
 
-`postCallbackDelayedInternal()`（622）把回调按`dueTime`插进`mCallbackQueues[callbackType]`；`dueTime <= now`时立刻`scheduleFrameLocked(now)`，否则投一条异步`MSG_DO_SCHEDULE_CALLBACK`。
+`postCallbackDelayedInternal()`把回调按`dueTime`插进`mCallbackQueues[callbackType]`；`dueTime <= now`时立刻`scheduleFrameLocked(now)`，否则投一条异步`MSG_DO_SCHEDULE_CALLBACK`。
 
-`postVsyncCallback(int callbackType, VsyncCallback callback)`（676）只是把token换成`VSYNC_CALLBACK_TOKEN`再转调：
+`postVsyncCallback(int callbackType, VsyncCallback callback)`只是把token换成`VSYNC_CALLBACK_TOKEN`再转调：
 
 ```java
-// Choreographer.java:676
+// frameworks/base/core/java/android/view/Choreographer.java
 public void postVsyncCallback(int callbackType, @NonNull VsyncCallback callback) {
     if (callback == null) {
         throw new IllegalArgumentException("callback must not be null");
     }
     postCallbackDelayedInternal(callbackType, callback, VSYNC_CALLBACK_TOKEN, 0);
 }
+
+private void postCallbackDelayedInternal(int callbackType, Object action, Object token, long delayMillis) {
+    synchronized (mLock) {
+        final long now = SystemClock.uptimeMillis();
+        final long dueTime = now + delayMillis;
+        // 先把回调加入对应CALLBACK_TRAVERSAL队列，后续VSYNC信号来了之后执行回调
+        mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token);
+        // delayMillis=0,本次请求没有延迟，立即执行
+        if (dueTime <= now) {
+            scheduleFrameLocked(now);
+        } else { // delayMillis>0 发异步消息执行
+            Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);
+            msg.arg1 = callbackType;
+            msg.setAsynchronous(true);
+            mHandler.sendMessageAtTime(msg, dueTime);
+        }
+    }
+}
 ```
 
 `delayMillis`为0时立刻`scheduleFrameLocked(now)`，这里再合并一次：
 
 ```java
-// Choreographer.java:919
+// frameworks/base/core/java/android/view/Choreographer.java
 private void scheduleFrameLocked(long now) {
     if (!mFrameScheduled) {
         mFrameScheduled = true;
@@ -156,18 +194,19 @@ private void scheduleFrameLocked(long now) {
 }
 ```
 
-`mFrameScheduled`保证一次Vsync最多申请一次。`scheduleVsyncLocked()`（1287）调用`mDisplayEventReceiver.scheduleVsync()`，native侧落到`DisplayEventReceiver::scheduleVsync()`，经Binder进入SurfaceFlinger进程的`EventThread::requestNextVsync()`，把该connection标记为“需要下一个Vsync”。
+`mFrameScheduled`保证一次Vsync最多申请一次。`scheduleVsyncLocked()`调用`mDisplayEventReceiver.scheduleVsync()`，native侧落到`NativeDisplayEventReceiver`去`scheduleVsync()`，最终由`DisplayEventReceiver`通过`IDisplayEventConnection`走Binder进入SurfaceFlinger进程的`EventThread::requestNextVsync()`，把该connection标记为需要下一个Vsync。
 
 ### 2.2 EventThread投递Vsync
 
-SurfaceFlinger进程至少有两个EventThread：服务App的`VSYNC-app`和服务自身的`VSYNC-sf`。Vsync由`VsyncDispatchTimerQueue`按时回调，EventThread的`onVsync()`把事件塞进`mPendingEvents`：
+SurfaceFlinger进程根据不同Android版本有不同的EventThread，最新的A17中，只保留了服务App的`VSYNC-app`。Vsync由`VsyncDispatchTimerQueue`按时回调`EventThread`的`onVsync`，EventThread的`onVsync()`把Vsync事件塞进`mPendingEvents`并唤醒自己去`dispatchEvent()`：
 
 ```cpp
-// frameworks/native/services/surfaceflinger/Scheduler/EventThread.cpp:472
+// frameworks/native/services/surfaceflinger/Scheduler/EventThread.cpp
 void EventThread::onVsync(nsecs_t vsyncTime, nsecs_t wakeupTime, nsecs_t readyTime) {
     std::lock_guard<std::mutex> lock(mMutex);
     mLastVsyncCallbackTime = TimePoint::fromNs(vsyncTime);
     LOG_FATAL_IF(!mVSyncState);
+    // Trace中观察到VSYNC-app信号翻转
     mVsyncTracer = (mVsyncTracer + 1) % 2;
     mPendingEvents.push_back(makeVSync(mVsyncSchedule->getPhysicalDisplayId(), wakeupTime,
                                        ++mVSyncState->count, vsyncTime, readyTime));
@@ -175,12 +214,14 @@ void EventThread::onVsync(nsecs_t vsyncTime, nsecs_t wakeupTime, nsecs_t readyTi
 }
 ```
 
-`mVsyncTracer`就是systrace里`VSYNC-app`的翻转计数线。随后EventThread线程`dispatchEvent()`把事件写入订阅者的`BitTube`，App进程Looper被唤醒。
+`mVsyncTracer`就是systrace里`VSYNC-app`的翻转计数线。随后EventThread线程`dispatchEvent()`把Vsync事件写入对应`EventThreadConnection`的`BitTube`，App进程Looper被唤醒。
 
 ### 2.3 FrameDisplayEventReceiver把Vsync变成消息
 
+App进程中Looper被唤醒后逐步回调到`FrameDisplayEventReceiver`的`onVsync`
+
 ```java
-// Choreographer.java:1579（节选）
+// frameworks/base/core/java/android/view/Choreographer.java
 private final class FrameDisplayEventReceiver extends DisplayEventReceiver
         implements Runnable {
     @Override
@@ -195,6 +236,7 @@ private final class FrameDisplayEventReceiver extends DisplayEventReceiver
         mLastVsyncEventData.copyFrom(vsyncEventData);
         Message msg = Message.obtain(mHandler, this);
         msg.setAsynchronous(true);
+        // 把自己作为异步消息的callback发送，后续执行doFrame()
         mHandler.sendMessageAtTime(msg, timestampNanos / TimeUtils.NANOS_PER_MS);
     }
 
@@ -205,33 +247,62 @@ private final class FrameDisplayEventReceiver extends DisplayEventReceiver
 }
 ```
 
-关键点是`setAsynchronous(true)`：主线程队列上可能有第1步插入的同步屏障，异步消息可以越过它，同步消息不能。消息时间设为Vsync时刻，队列里更早的同步消息会先处理，Vsync不会饿死整个队列。17上还多了一个保护：如果Vsync时间戳在未来，先夹到`System.nanoTime()`。
+关键点是`setAsynchronous(true)`：主线程队列上可能有第1步插入的同步屏障，异步消息可以越过它，同步消息不能。消息时间设为Vsync时刻，队列里更早的同步消息会先处理，Vsync不会饿死整个队列。
 
 ### 2.4 doFrame的执行顺序
 
-`doFrame(long frameTimeNanos, int frame, VsyncEventData vsyncEventData)`在1074行，回调派发改成了只带callbackType的`doCallbacks(int)`：
+`doFrame(long frameTimeNanos, int frame, VsyncEventData vsyncEventData)`中回调派发改成了只带callbackType的`doCallbacks(int)`：
 
 ```java
-// Choreographer.java:1201-1211
+// frameworks/base/core/java/android/view/Choreographer.java
 mFrameInfo.markInputHandlingStart();
 doCallbacks(Choreographer.CALLBACK_INPUT);
-
 mFrameInfo.markAnimationsStart();
 doCallbacks(Choreographer.CALLBACK_ANIMATION);
 doCallbacks(Choreographer.CALLBACK_INSETS_ANIMATION);
-
 mFrameInfo.markPerformTraversalsStart();
 doCallbacks(Choreographer.CALLBACK_TRAVERSAL);
-
 doCallbacks(Choreographer.CALLBACK_COMMIT);
 ```
 
-常量定义在321行到363行：`CALLBACK_INPUT = 0`、`CALLBACK_ANIMATION = 1`、`CALLBACK_INSETS_ANIMATION = 2`、`CALLBACK_TRAVERSAL = 3`、`CALLBACK_COMMIT = 4`。
+常量定义为`CALLBACK_INPUT = 0`、`CALLBACK_ANIMATION = 1`、`CALLBACK_INSETS_ANIMATION = 2`、`CALLBACK_TRAVERSAL = 3`、`CALLBACK_COMMIT = 4`。
 
-`doCallbacks(int)`（1229）执行时把`mFrameData`传给每条`CallbackRecord.run(FrameData)`（1661）：
+`doCallbacks(int)`执行时把`mFrameData`传给每条`CallbackRecord.run(FrameData)`：
 
 ```java
-// Choreographer.java:1661
+// frameworks/base/core/java/android/view/Choreographer.java
+void doCallbacks(int callbackType) {
+    CallbackRecord callbacks;
+    long frameTimeNanos = mFrameData.mFrameTimeNanos;
+    synchronized (mLock) {
+        // 用now而非frameTime判定到期，一帧内先执行的阶段(input)可能post了后阶段(animation)要跑的回调,这些回调dueTime介于frameTime与now之间,用now才能保证本帧就执行
+        final long now = System.nanoTime();
+        callbacks = mCallbackQueues[callbackType].extractDueCallbacksLocked(now / TimeUtils.NANOS_PER_MS);
+        if (callbacks == null) {
+            return;
+        }
+        mCallbacksRunning = true;
+    }
+    try {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, CALLBACK_TRACE_TITLES[callbackType]);
+        for (CallbackRecord c = callbacks; c != null; c = c.next) {
+            ...
+            // callback执行
+            c.run(mFrameData);
+        }
+    } finally {
+        synchronized (mLock) {
+            mCallbacksRunning = false;
+            do {
+                final CallbackRecord next = callbacks.next;
+                recycleCallbackLocked(callbacks);
+                callbacks = next;
+            } while (callbacks != null);
+        }
+        Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+    }
+}
+
 void run(FrameData frameData) {
     frameData.setInCallback(true);
     if (token == VSYNC_CALLBACK_TOKEN) {
@@ -241,6 +312,14 @@ void run(FrameData frameData) {
     }
     frameData.setInCallback(false);
 }
+
+public void run(long frameTimeNanos) {
+    if (token == FRAME_CALLBACK_TOKEN) {
+        ((FrameCallback)action).doFrame(frameTimeNanos);
+    } else {
+        ((Runnable)action).run();
+    }
+}
 ```
 
 所以第1步注册的`mTraversalCallback`在`CALLBACK_TRAVERSAL`阶段收到`FrameData`，再调`doTraversal(frameData.getFrameTimeNanos())`。顺序含义：
@@ -248,18 +327,17 @@ void run(FrameData frameData) {
 - `INPUT`最先，保证本帧输入在动画和布局前被消费，后续阶段能看到新状态。
 - `ANIMATION`→`INSETS_ANIMATION`：两者都是“改状态”，必须在traversal之前完成。
 - `TRAVERSAL`读取前面所有阶段的结果，执行measure、layout、draw。
-- `COMMIT`在traversal之后，用于提交本帧事务回调（例如`SurfaceSyncGroup`）。
+- `COMMIT`在traversal之后，用于提交本帧事务回调。
 
-`doFrame()`进入回调前还有几件处理：
+`doFrame()`开始回调前还有几件处理：
 
 1. jitter对齐。若`System.nanoTime() - frameTimeNanos`超过一个帧间隔，说明主线程错过Vsync太久，Choreographer把`frameTimeNanos`对齐到当前时间并减去`jitterNanos % frameIntervalNanos`，跳帧过多时打印`Skipped N frames!`。
-2. `mFPSDivisor`降帧。若`mFPSDivisor > 1`，距上一帧不足`frameIntervalNanos * mFPSDivisor`时直接`scheduleVsyncLocked()`并返回（1171附近）。
-3. 帧时间倒退检查。若`frameTimeNanos < mLastFrameTimeNanos`，`scheduleVsyncLocked()`后返回。
-4. buffer stuffing恢复。`updateBufferStuffingState()`可能返回`DELAY_FRAME`，主动推迟一帧以降低排队buffer数；返回`OFFSET`时会把动画时间轴整体减一个帧间隔。
-
-`doFrame()`在`mLock`内先检查`if (!mFrameScheduled) return;`（1114），它与`scheduleFrameLocked()`的`mFrameScheduled`配对，防止迟到的Vsync多执行一次回调。
+2. 帧时间倒退检查。若`frameTimeNanos < mLastFrameTimeNanos`，`scheduleVsyncLocked()`后返回。
+3. buffer stuffing恢复。`updateBufferStuffingState()`可能返回`DELAY_FRAME`，主动推迟一帧以降低排队buffer数；返回`OFFSET`时会把动画时间轴整体减一个帧间隔。
 
 ## 第3步：performTraversals与DisplayList录制
+
+![alt text](image-2.png)
 
 ### 3.1 三个阶段的取舍
 
@@ -270,14 +348,14 @@ void run(FrameData frameData) {
 - `performDraw()`：窗口可见、Surface有效、确实有脏区域时执行；`mFullRedrawNeeded`为true时整窗重绘。
 
 ```java
-// ViewRootImpl.java:4599
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 if (mViewMeasureDeferred) {
     performMeasure(MeasureSpec.makeMeasureSpec(frame.width(), MeasureSpec.EXACTLY),
                    MeasureSpec.makeMeasureSpec(frame.height(), MeasureSpec.EXACTLY));
 }
-// ViewRootImpl.java:4638
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 performLayout(lp, mWidth, mHeight);
-// ViewRootImpl.java:4903
+// frameworks/base/core/java/android/view/ViewRootImpl.java
 if (!performDraw(mActiveSurfaceSyncGroup)) { ... }
 ```
 
@@ -285,29 +363,52 @@ if (!performDraw(mActiveSurfaceSyncGroup)) { ... }
 
 ### 3.2 硬件加速绘制入口
 
-`performDraw(@Nullable SurfaceSyncGroup)`定义在5940行，硬件加速分支在6260行之后：
+`performDraw(@Nullable SurfaceSyncGroup)`：
 
 ```java
-// ViewRootImpl.java:6260
-if (isHardwareEnabled()) {
-    boolean invalidateRoot = accessibilityFocusDirty || mInvalidateRootRequested;
+private boolean performDraw(@Nullable SurfaceSyncGroup surfaceSyncGroup) {
     ...
-    dirty.setEmpty();
-    final boolean updated = updateContentDrawBounds();
-    ...
-    mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
-} else {
-    if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
-            scalingRequired, dirty)) {
-        return false;
+    Trace.traceBegin(Trace.TRACE_TAG_VIEW, mDrawTrace);
+    addFrameCommitCallbackIfNeeded();
+    boolean usingAsyncReport;
+    try {
+        usingAsyncReport = draw(fullRedrawNeeded, surfaceSyncGroup, mSyncBuffer);
+        if (mAttachInfo.mThreadedRenderer != null && !usingAsyncReport) {
+            mAttachInfo.mThreadedRenderer.setFrameCallback(null);
+        }
+    } finally {
+        mIsDrawing = false;
+        Trace.traceEnd(Trace.TRACE_TAG_VIEW);
     }
+    ...
 }
 ```
 
-硬件加速时并没有直接往Surface上画。`ThreadedRenderer.draw()`（827）做的是“录制+同步”：
+调用draw():
 
 ```java
-// frameworks/base/core/java/android/view/ThreadedRenderer.java:827
+// frameworks/base/core/java/android/view/ViewRootImpl.java
+private boolean draw(boolean fullRedrawNeeded, @Nullable SurfaceSyncGroup activeSyncGroup,
+            boolean syncBuffer) {
+    ...
+    if (isHardwareEnabled()) {
+        ...
+        mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
+        ...
+    } else {
+        if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
+                scalingRequired, dirty)) {
+            return false;
+        }
+    }
+    ...
+}
+```
+
+硬件加速时并没有直接往Surface上画。`ThreadedRenderer.draw()`做的是“录制+同步”：
+
+```java
+// frameworks/base/core/java/android/view/ThreadedRenderer.java
 void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
     attachInfo.mViewRootImpl.mViewFrameInfo.markDrawStart();
     updateRootDisplayList(view, callbacks);
@@ -318,12 +419,20 @@ void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
 }
 ```
 
-`updateRootDisplayList()`（730）更新View树的DisplayList，`syncAndDrawFrame()`（848调用处）才把树同步给RenderThread。
+`updateRootDisplayList()`更新View树的DisplayList，`syncAndDrawFrame()`才把树同步给RenderThread。
 
 ### 3.3 每个View的RenderNode与DisplayList
 
 ```java
-// ThreadedRenderer.java:721
+// frameworks/base/core/java/android/view/ThreadedRenderer.java
+// 录制根View的DisplayList
+private void updateRootDisplayList(View view, DrawCallbacks callbacks) {
+    Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Record View#draw()");
+    updateViewTreeDisplayList(view);
+    ...
+    Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+}
+
 private void updateViewTreeDisplayList(View view) {
     view.mPrivateFlags |= View.PFLAG_DRAWN;
     view.mRecreateDisplayList = (view.mPrivateFlags & View.PFLAG_INVALIDATED)
@@ -334,10 +443,10 @@ private void updateViewTreeDisplayList(View view) {
 }
 ```
 
-`View.updateDisplayListIfDirty()`在24306行，17上多了一条“只需要更新子节点”的快速路径：
+`View.updateDisplayListIfDirty()`：
 
 ```java
-// frameworks/base/core/java/android/view/View.java:24306
+// frameworks/base/core/java/android/view/View.java
 public RenderNode updateDisplayListIfDirty() {
     final RenderNode renderNode = mRenderNode;
     if (!canHaveDisplayList()) {
@@ -350,6 +459,7 @@ public RenderNode updateDisplayListIfDirty() {
                 && !mRecreateDisplayList) {
             mPrivateFlags |= PFLAG_DRAWN | PFLAG_DRAWING_CACHE_VALID;
             mPrivateFlags &= ~PFLAG_DIRTY_MASK;
+            // 这里递归遍历子view
             dispatchGetDisplayList();
             return renderNode; // no work needed
         }
@@ -363,6 +473,7 @@ public RenderNode updateDisplayListIfDirty() {
                 computeScroll();
                 canvas.translate(-mScrollX, -mScrollY);
                 if ((mPrivateFlags & PFLAG_SKIP_DRAW) == PFLAG_SKIP_DRAW) {
+                    // 这里递归绘制子View
                     dispatchDraw(canvas);
                 } else {
                     draw(canvas);
@@ -377,59 +488,84 @@ public RenderNode updateDisplayListIfDirty() {
 }
 ```
 
-固定关系：
-
 - 每个View持有一个`RenderNode`（`mRenderNode`）。
 - `beginRecording()`返回`RecordingCanvas`，`View.draw()`、`onDraw()`、`dispatchDraw()`里的`drawRect()`、`drawPath()`、`drawText()`都变成DisplayList指令。
 - `endRecording()`把DisplayList封进RenderNode。
-- 父子View在绘制时表现为RenderNode树的引用：父View调`drawRenderNode(childRenderNode)`，记录子RenderNode的引用，不复制子指令。
+- 父子View之间不是子指令并进父的DisplayList的关系，而是引用：子View在自己的`draw(Canvas, ViewGroup, long)`末尾，对父View传进来的`RecordingCanvas`调`drawRenderNode(自己的mRenderNode)`，使得父View的DisplayList里多一条指向子RenderNode的引用。
 
 ```java
-// View.java:25387
-if (drawingWithRenderNode) {
-    mPrivateFlags &= ~PFLAG_DIRTY_MASK;
-    ((RecordingCanvas) canvas).drawRenderNode(renderNode);
+// frameworks/base/core/java/android/view/View.java
+boolean draw(@NonNull Canvas canvas, ViewGroup parent, long drawingTime) {
+    ...
+    if (drawingWithRenderNode) {
+        mPrivateFlags &= ~PFLAG_DIRTY_MASK;
+        ((RecordingCanvas) canvas).drawRenderNode(renderNode);
+    }
+    ...
 }
 ```
 
-`ViewGroup.drawChild()`只是`child.draw(canvas, this, drawingTime)`，真正的`drawRenderNode`发生在子View的`draw(Canvas, ViewGroup, long)`里。遍历结束后，根RenderNode的DisplayList里是子RenderNode的引用，整棵树没有被压成扁平指令流。
+RenderNode树引用的实际收益是“只重录脏子树”：后代`invalidate()`时只清祖先的`PFLAG_DRAWING_CACHE_VALID`、不置`PFLAG_INVALIDATED`，根节点`updateDisplayListIfDirty()`只走`dispatchGetDisplayList()`往下刷脏节点，父的DisplayList不重录；因为每个View的RenderNode身份不变，旧引用继续指向该子节点最新的DisplayList。所以根RenderNode的DisplayList里是子RenderNode的引用，整棵树没有被压成扁平指令流。
 
 ### 3.4 本步结束时的状态
 
 - 所有脏View的DisplayList已更新。
 - 根RenderNode已挂好整棵RenderNode树。
 - UI线程还没把树交给RenderThread，GPU未执行任何指令。
-- `mFrameInfo`已记录`DrawStart`等时间点。
 
 真正的跨线程同步在下一步。
 
 ## 第4步：把RenderNode树交给RenderThread
 
+![alt text](image-3.png)
+
 ### 4.1 Java到JNI
 
 ```java
-// frameworks/base/graphics/java/android/graphics/HardwareRenderer.java:595
+// frameworks/base/graphics/java/android/graphics/HardwareRenderer.java
 @SyncAndDrawResult
 public int syncAndDrawFrame(@NonNull FrameInfo frameInfo) {
     return nSyncAndDrawFrame(mNativeProxy, frameInfo.frameInfo, frameInfo.frameInfo.length);
 }
 ```
 
-native声明在1845行。`mNativeProxy`指向native侧`RenderProxy`。`frameInfo.frameInfo`是`long[]`，UI线程写入Vsync、deadline、FrameTimelineVsyncId等时间戳，RenderThread读同一块数组。
+`mNativeProxy`是`private final long`，在构造函数里由`nCreateProxy(!mOpaque, mRootNode.mNativeRenderNode)`赋值；JNI侧`android_view_ThreadedRenderer_createProxy()`执行`new RenderProxy(...)`后把指针按`jlong`返回
 
-JNI侧（`android_graphics_HardwareRenderer.cpp:464`）先用`GetLongArrayRegion()`把Java数组拷进`proxy->frameInfo()`，再调用`proxy->syncAndDrawFrame()`；参数个数会与`UI_THREAD_FRAME_INFO_SIZE`做`LOG_ALWAYS_FATAL_IF`校验。
+native方法声明与注册项（`android_graphics_HardwareRenderer.cpp`）：
+
+```java
+private static native int nSyncAndDrawFrame(long nativeProxy, long[] frameInfo, int size);
+```
+
+```cpp
+{"nSyncAndDrawFrame", "(J[JI)I", (void*)android_view_ThreadedRenderer_syncAndDrawFrame},
+```
+
+JNI函数体三步：校验长度、把Java数组拷进task的`mFrameInfo`、调进`RenderProxy`：
+
+```cpp
+static int android_view_ThreadedRenderer_syncAndDrawFrame(JNIEnv* env, jobject clazz,
+        jlong proxyPtr, jlongArray frameInfo, jint frameInfoSize) {
+    LOG_ALWAYS_FATAL_IF(frameInfoSize != UI_THREAD_FRAME_INFO_SIZE,
+            "Mismatched size expectations, given %d expected %zu", frameInfoSize,
+            UI_THREAD_FRAME_INFO_SIZE);
+    RenderProxy* proxy = reinterpret_cast<RenderProxy*>(proxyPtr);
+    env->GetLongArrayRegion(frameInfo, 0, frameInfoSize, proxy->frameInfo());
+    return proxy->syncAndDrawFrame();
+}
+```
 
 ### 4.2 RenderProxy与DrawFrameTask
 
 ```cpp
-// frameworks/base/libs/hwui/renderthread/RenderProxy.cpp:237
+// frameworks/base/libs/hwui/renderthread/RenderProxy.cpp
 int RenderProxy::syncAndDrawFrame() {
     return mDrawFrameTask.drawFrame();
 }
 ```
 
 ```cpp
-// frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp:72
+// frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp
 int DrawFrameTask::drawFrame() {
     LOG_ALWAYS_FATAL_IF(!mContext, "Cannot drawFrame with no CanvasContext!");
     mSyncResult = SyncResult::OK;
@@ -457,7 +593,7 @@ void DrawFrameTask::postAndWait() {
 - 同步点：`syncFrameState()`完成，RenderThread确认树可绘制，`unblockUiThread()`唤醒UI线程。
 - 同步点后：UI线程可以修改View树，RenderThread继续`context->draw()`。
 
-所以“UI线程与RenderThread的同步边界”不是等到上屏，而是等到“树状态已被RenderThread接走”。
+所以UI线程与RenderThread的同步边界是等到树状态已被RenderThread接走。
 
 ## 第5步：RenderThread同步树状态
 
