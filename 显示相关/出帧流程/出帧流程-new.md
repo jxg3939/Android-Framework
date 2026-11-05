@@ -597,10 +597,14 @@ void DrawFrameTask::postAndWait() {
 
 ## 第5步：RenderThread同步树状态
 
-### 5.1 run()的开头
+![alt text](image-4.png)
+
+UI线程`postAndWait()`之后，RenderThread的`threadLoop()`本来在`waitForWork()`（`mLooper->pollOnce(timeout)`）中阻塞，如今被唤醒，开始进入`processQueue()`（`WorkQueue::process()`在锁外逐个执行`item.work()`,`item.work()`调用最终落到`DrawFrameTask::run()`）
+
+### 5.1 DrawFrameTask::run()
 
 ```cpp
-// frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp:89
+// frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp
 void DrawFrameTask::run() {
     mContext->setSyncDelayDuration(systemTime(SYSTEM_TIME_MONOTONIC) - mSyncQueued);
     mContext->setTargetSdrHdrRatio(mRenderSdrHdrRatio);
@@ -612,15 +616,19 @@ void DrawFrameTask::run() {
         TreeInfo info(TreeInfo::MODE_FULL, *mContext);
         info.forceDrawFrame = mForceDrawFrame;
         mForceDrawFrame = false;
+        // 帧状态同步，重点在RenderNode树的同步
         canUnblockUiThread = syncFrameState(info);
+        // 决定了本帧能不能绘制
         canDrawThisFrame = !info.out.skippedFrameReason.has_value();
         solelyTextureViewUpdates = info.out.solelyTextureViewUpdates;
     }
+    // UI线程postAndWait结束 可以去准备下一帧的绘制
     if (canUnblockUiThread) {
         unblockUiThread();
     }
     ...
     if (CC_LIKELY(canDrawThisFrame)) {
+        // 走到第6步的Draw()
         context->draw(solelyTextureViewUpdates);
     } else {
         if (GrDirectContext* grContext = mRenderThread->getGrContext()) {
@@ -634,16 +642,16 @@ void DrawFrameTask::run() {
 }
 ```
 
-`syncFrameState()`在169行：
-
 ```cpp
-// DrawFrameTask.cpp:169
+// frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp
 bool DrawFrameTask::syncFrameState(TreeInfo& info) {
     int64_t vsync = mFrameInfo[static_cast<int>(FrameInfoIndex::Vsync)];
     ...
     mRenderThread->timeLord().vsyncReceived(vsync, intendedVsync, vsyncId, frameDeadline,
             frameInterval);
+    // 当前渲染线程即将使用这个CanvasContext绑定的图形上下文
     bool canDraw = mContext->makeCurrent();
+    // 释放之前为了复用而缓存的图像资源
     mContext->unpinImages();
     for (size_t i = 0; i < mLayers.size(); i++) {
         if (mLayers[i]) {
@@ -653,17 +661,36 @@ bool DrawFrameTask::syncFrameState(TreeInfo& info) {
     mLayers.clear();
     mContext->setContentDrawBounds(mContentDrawBounds);
     mContext->prepareTree(info, mFrameInfo, mSyncQueued, mTargetNode);
-    ...
+    bool hasTarget = mContext->hasOutputTarget();
+    if (CC_UNLIKELY(!hasTarget || !canDraw)) {
+        if (!hasTarget) {
+            mSyncResult |= SyncResult::LostSurfaceRewardIfFound;
+            info.out.skippedFrameReason = SkippedFrameReason::NoOutputTarget;
+        } else {
+            mSyncResult |= SyncResult::ContextIsStopped;
+            info.out.skippedFrameReason = SkippedFrameReason::ContextIsStopped;
+        }
+    }
+    if (info.out.hasAnimations) {
+        if (info.out.requiresUiRedraw) {
+            mSyncResult |= SyncResult::UIRedrawRequired;
+        }
+    }
+    if (info.out.skippedFrameReason) {
+        mSyncResult |= SyncResult::FrameDropped;
+    }
     return info.prepareTextures;
 }
 ```
 
-`TimeLord::vsyncReceived()`记录本帧Vsync、deadline、frameInterval；`makeCurrent()`确保EGL context可用；`apply()`处理DeferredLayerUpdater（TextureView、SurfaceView等外部纹理层）的更新；`prepareTree()`遍历RenderNode树。
+`TimeLord::vsyncReceived()`记录本帧Vsync、deadline、frameInterval；`makeCurrent()`确保EGL context可用；`unpinImages()`放开UI线程上一帧pin住的图片（pin是为了保证RenderThread上传期间Bitmap不被回收）；`apply()`处理DeferredLayerUpdater（TextureView、SurfaceView等外部纹理层）的更新；`prepareTree()`遍历RenderNode树。
+
+注意`hasOutputTarget()`的检查放在`prepareTree()`之后，prepareTree可能flush掉pending操作（树状态、预取layer等），先查会读到旧状态。失败原因写进`info.out.skippedFrameReason`，同时置`mSyncResult`位，`run()`里的`canDrawThisFrame`和UI线程读到的返回值都从这里来。返回值`info.prepareTextures`为false表示纹理缓存已满、没备齐，所以`run()`不敢提前放行UI线程。
 
 ### 5.2 prepareTree做了什么
 
 ```cpp
-// frameworks/base/libs/hwui/renderthread/CanvasContext.cpp:506
+// frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
 void CanvasContext::prepareTree(TreeInfo& info, int64_t* uiFrameInfo, int64_t syncQueued,
                                 RenderNode* target) {
     ...
@@ -683,108 +710,207 @@ void CanvasContext::prepareTree(TreeInfo& info, int64_t* uiFrameInfo, int64_t sy
     }
     ...
 }
+// frameworks/base/libs/hwui/RenderNode.cpp
+void RenderNode::prepareTree(TreeInfo& info) {
+    ATRACE_CALL();
+    LOG_ALWAYS_FATAL_IF(!info.damageAccumulator, "DamageAccumulator missing");
+    MarkAndSweepRemoved observer(&info);
+    const int before = info.disableForceDark;
+    // 递归处理整颗树
+    prepareTreeImpl(observer, info, false);
+    LOG_ALWAYS_FATAL_IF(before != info.disableForceDark, "Mis-matched force dark");
+}
 ```
 
 `prepareTree()`逐个`node->prepareTree(info)`，把DisplayList属性同步到RenderThread可见状态：变换矩阵、裁剪、alpha、动画属性、DisplayList版本。动画属性在`mAnimationContext->runRemainingAnimations()`里推进。
 
-`MODE_FULL`用于窗口主RenderNode，完整同步；`MODE_RT_ONLY`用于其他node，只同步RenderThread需要的最小状态。17上还维护`mSkippedFrameInfo`：如果上一帧因`NoOutputTarget`、`NoBuffer`等原因被跳过，本帧会沿用旧帧结构并把跳过信息上报给FrameTimeline。
+`MODE_FULL`用于窗口主RenderNode，完整同步；`MODE_RT_ONLY`用于其他node，只同步RenderThread需要的最小状态
 
-### 5.3 这一步之后
+### 5.3 syncFrameState()完成
 
-`syncFrameState()`返回后，`run()`按`canDrawThisFrame`决定：true则`CanvasContext::draw()`进入第6步；false则不画，直接`flushAndSubmit()`并`waitOnFences()`，避免与下一帧GPU工作重叠。
+`syncFrameState()`返回后，`run()`按`canDrawThisFrame`决定：true则`CanvasContext::draw()`进入第6步；false则不画，直接`flushAndSubmit()`并`waitOnFences()`，这里的`waitOnFences()`是回收本帧已提交的内部异步工作，与后续Buffer的fence无关
 
-同步点之后UI线程已可继续处理消息。RenderThread拿到的是“属性快照+DisplayList引用”，不是UI线程的实时View对象。
+同步点之后UI线程已可继续处理消息。RenderThread拿到的是属性快照+DisplayList引用。这个快照机制依赖于RenderNode内的`mStagingDisplayList`和`mDisplayList`双缓存，`mStagingDisplayList`用于UI线程录制，`mDisplayList`用于RenderThread绘制
 
 ## 第6步：从BLAST BufferQueue申请Buffer
 
+![alt text](image-5.png)
+
 ### 6.1 draw()到getFrame()
 
-`CanvasContext::draw()`（672）在算完脏区域后调用`getFrame()`（664）；`getFrame()`若有`mHardwareBuffer`就直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。当前窗口的渲染管线是`SkiaOpenGLPipeline`，它的`getFrame()`（110）只把`mEglSurface`交给`mEglManager.beginFrame()`。
-
 ```cpp
-// frameworks/base/libs/hwui/renderthread/EglManager.cpp:592（节选）
-makeCurrent(surface);
-Frame frame;
-frame.mSurface = surface;
-eglQuerySurface(mEglDisplay, surface, EGL_WIDTH, &frame.mWidth);
-eglQuerySurface(mEglDisplay, surface, EGL_HEIGHT, &frame.mHeight);
-frame.mBufferAge = queryBufferAge(surface);
-eglBeginFrame(mEglDisplay, surface);
+void CanvasContext::draw(bool solelyTextureViewUpdates) {
+    ...
+    // 获取本帧脏区域
+    SkRect dirty;
+    mDamageAccumulator.finish(&dirty);
+    ...
+    // 判断是否跳过本帧绘制
+    const auto skippedFrameReason = [&]() -> std::optional<SkippedFrameReason> {
+        if (!Properties::isDrawingEnabled() || !mDrawingEnabled) {
+            return SkippedFrameReason::DrawingOff;
+        }
+        if (dirty.isEmpty() && Properties::skipEmptyFrames && !surfaceRequiresRedraw()) {
+            return SkippedFrameReason::NothingToDraw;
+        }
+        return std::nullopt;
+    }();
+    if (skippedFrameReason) {
+        // 跳过绘制，通知回调本帧没有产生 Buffer
+        ...
+        waitOnFences();
+        for (auto& func : mFrameCommitCallbacks) {
+            std::invoke(func, false);
+        }
+        mFrameCommitCallbacks.clear();
+        return;
+    }
+    ScopedActiveContext activeContext(this);
+    // 初始化帧信息，获取当前 Frame
+    mCurrentFrameInfo->set(FrameInfoIndex::FrameInterval) =
+            mRenderThread.timeLord().frameIntervalNanos();
+    mCurrentFrameInfo->markIssueDrawCommandsStart();
+    Frame frame = getFrame();
+    SkRect windowDirty = computeDirtyRect(frame, &dirty);
+    // 执行实际绘制，生成绘制结果
+    ATRACE_FORMAT("Drawing " RECT_STRING, SK_RECT_ARGS(dirty));
+    IRenderPipeline::DrawResult drawResult;
+    {
+    drawResult = mRenderPipeline->draw(
+            frame, windowDirty, dirty, mLightGeometry, &mLayerUpdateQueue,
+            mContentDrawBounds, mOpaque, mLightInfo, mRenderNodes,
+            &(profiler()), mBufferParams, profilerLock());
+    }
+    uint64_t frameCompleteNr = getFrameNumber();
+    waitOnFences();
+    ...
+    // 执行Buffer Swap，将绘制结果提交到Surface
+    bool requireSwap = false;
+    bool didSwap = mRenderPipeline->swapBuffers(
+            frame, drawResult, windowDirty, mCurrentFrameInfo, &requireSwap);
+    ...
+    // 处理Swap结果
+    if (requireSwap) {
+        ...
+        if (error == TIMED_OUT) {
+            mRenderThread.postFrameCallback(this);
+        } else if (error != OK || !didSwap) {
+            setSurface(nullptr);
+        }
+        ..
+    }
+    mCurrentFrameInfo->markSwapBuffersCompleted();
+    // 通知帧提交回调
+    if (didSwap) {
+        for (auto& func : mFrameCommitCallbacks) {
+            std::invoke(func, true);
+        }
+        mFrameCommitCallbacks.clear();
+    }
+    ...
+}
 ```
 
-`eglBeginFrame()`由EGL实现落到`ANativeWindow_dequeueBuffer()`。App的`ANativeWindow`是`ReliableSurface`包装的`Surface`，调用链：
+`CanvasContext::draw()`在算完脏区域后调用`getFrame()`；`getFrame()`若有`mHardwareBuffer`就直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。参考SKia渲染管线`SkiaOpenGLPipeline`，它的`getFrame()`只把`mEglSurface`交给`mEglManager.beginFrame()`。
+
+```cpp
+// frameworks/base/libs/hwui/renderthread/EglManager.cpp
+Frame EglManager::beginFrame(EGLSurface surface) {
+    LOG_ALWAYS_FATAL_IF(surface == EGL_NO_SURFACE, "Tried to beginFrame on EGL_NO_SURFACE!");
+    makeCurrent(surface);
+    Frame frame;
+    frame.mSurface = surface;
+    eglQuerySurface(mEglDisplay, surface, EGL_WIDTH, &frame.mWidth);
+    eglQuerySurface(mEglDisplay, surface, EGL_HEIGHT, &frame.mHeight);
+    frame.mBufferAge = queryBufferAge(surface);
+    eglBeginFrame(mEglDisplay, surface);
+    return frame;
+}
+```
+
+`eglBeginFrame()`由EGL实现落到`ANativeWindow_dequeueBuffer()`
+
+```cpp
+// frameworks/native/libs/nativewindow/ANativeWindow.cpp
+int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd) {
+    return window->dequeueBuffer(window, buffer, fenceFd);
+}
+```
 
 ```text
-ReliableSurface::hook_dequeueBuffer
-  → Surface::hook_dequeueBuffer
-    → Surface::dequeueBuffer(sp<GraphicBuffer>*, int*)
-      → IGraphicBufferProducer::dequeueBuffer
-        → BBQBufferQueueProducer::dequeueBuffer
-          → BufferQueueProducer::dequeueBuffer
+window->dequeueBuffer(window, &buf, &fence)   // ANativeWindow_dequeueBuffer
+        ->Surface::dequeueBuffer(sp<GraphicBuffer>*, int*)
+         -> IGraphicBufferProducer::dequeueBuffer  这里Binder调用还在本进程内
+           ->BBQBufferQueueProducer::dequeueBuffer  未实现，调用BufferQueueProducer的dequeueBuffer
+            ->BufferQueueProducer::dequeueBuffer
 ```
 
 ### 6.2 Surface::dequeueBuffer
 
-17上`Surface`内部方法已经改成`sp<GraphicBuffer>`版本，`android_native_buffer_t*`只出现在hook里：
-
 ```cpp
-// frameworks/native/libs/gui/Surface.cpp:752
+// frameworks/native/libs/gui/Surface.cpp
+status_t Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, sp<Fence>* outFence) {
+    if (buffer == nullptr || outFence == nullptr) {
+        return BAD_VALUE;
+    }
+    sp<GraphicBuffer> tmpBuffer;
+    int fd = -1;
+    status_t res = dequeueBuffer(&tmpBuffer, &fd);
+    if (res != NO_ERROR) {
+        SURF_LOGV("dequeueBuffer() returned %d", res);
+        return res;
+    }
+    *buffer = tmpBuffer;
+    *outFence = sp<Fence>::make(fd);
+    return res;
+}
+
+内部转发
+
 int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
+    {
+        std::scoped_lock _dl(mDebugMutex);
+        ATRACE_FORMAT("dequeueBuffer - %s", mDebugName.c_str());
+    }
     ...
-    getDequeueBufferInputLocked(&dqInput);
     int buf = -1;
     sp<Fence> fence;
     status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence, dqInput.width,
                                                             dqInput.height, dqInput.format,
                                                             dqInput.usage, &mBufferAge,
-                                                            dqInput.getTimestamps ? &frameTimestamps
-                                                                                  : nullptr);
-    ...
-    *buffer = mSlots[buf].buffer;
-    *fenceFd = fence ? fence->dup() : -1;
-    return OK;
-}
-```
-
-`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`，创建时同时打开release通道：
-
-```cpp
-// frameworks/native/libs/gui/BLASTBufferQueue.cpp:1352
-void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer,
-                                         sp<IGraphicBufferConsumer>* outConsumer) {
-    std::unique_ptr<gui::BufferReleaseChannel::ConsumerEndpoint> bufferReleaseConsumer;
-    gui::BufferReleaseChannel::open(mName, bufferReleaseConsumer, mBufferReleaseProducer);
-    mBufferReleaseReader = std::make_shared<BufferReleaseReader>(std::move(bufferReleaseConsumer));
-    auto core = sp<BBQBufferQueueCore>::make(mBufferReleaseReader);
-    auto producer = sp<BBQBufferQueueProducer>::make(core, wp<BLASTBufferQueue>::fromExisting(this),
-                                                     mBufferReleaseReader);
-    auto consumer = sp<BufferQueueConsumer>::make(core);
-    consumer->setAllowExtraAcquire(true);
+                                                            dqInput.getTimestamps ?
+                                                                    &frameTimestamps : nullptr);
     ...
 }
 ```
+
+`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`
 
 ### 6.3 什么时候会在这里等待
 
-普通路径在拿不到空闲slot时调用`waitForBufferRelease()`，默认实现阻塞在`mDequeueCondition`上（`BufferQueueProducer.cpp:448`）：
+普通路径在拿不到空闲slot时调用`waitForBufferRelease()`，`BufferQueueProducer`的默认实现阻塞在`mDequeueCondition`上：
 
 ```cpp
-// frameworks/native/libs/gui/BufferQueueProducer.cpp:448（节选）
-if (mDequeueTimeout >= 0) {
-    std::cv_status result =
-            mCore->mDequeueCondition.wait_for(lock, std::chrono::nanoseconds(timeout));
-    if (result == std::cv_status::timeout) {
-        return TIMED_OUT;
+// frameworks/native/libs/gui/BufferQueueProducer.cpp
+status_t BufferQueueProducer::waitForBufferRelease(std::unique_lock<std::mutex>& lock,
+                                                   nsecs_t timeout) const {
+    if (mDequeueTimeout >= 0) {
+        std::cv_status result =
+                mCore->mDequeueCondition.wait_for(lock, std::chrono::nanoseconds(timeout));
+        if (result == std::cv_status::timeout) {
+            return TIMED_OUT;
+        }
+    } else {
+        mCore->mDequeueCondition.wait(lock);
     }
-} else {
-    mCore->mDequeueCondition.wait(lock);
+    return OK;
 }
 ```
 
 BLAST路径在`BBQBufferQueueProducer`里重写这个方法，改为等SurfaceFlinger的release通知：
 
 ```cpp
-// BLASTBufferQueue.cpp:1302（节选）
+// frameworks/native/libs/gui/BLASTBufferQueue.cpp
 status_t waitForBufferRelease(std::unique_lock<std::mutex>& bufferQueueLock,
                               nsecs_t timeout) const override {
     mBufferReleaseReader->clearInterrupts();
@@ -798,52 +924,50 @@ status_t waitForBufferRelease(std::unique_lock<std::mutex>& bufferQueueLock,
 }
 ```
 
-`mBufferReleaseReader`读`BufferReleaseChannel`，SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`，channel有数据后`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值（`BLASTBufferQueue.cpp:200`），默认无限等待。
+`mBufferReleaseReader`读`BufferReleaseChannel`，SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`，channel有数据后`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值，默认无限等待。
 
-### 6.4 本步拿到的三样东西
+### 6.4 本步拿到的两样东西
 
 - 一个空闲slot对应的`GraphicBuffer`。
 - 该buffer从消费者侧继承的release fence（`fenceFd`）。EGL开始往这块buffer画之前必须等它，保证上一轮使用者已读完。
-- `mBufferAge`，用于决定需要重绘的区域（`SwapBehavior::BufferAge`下配合`eglSetDamageRegionKHR`）。
 
 此时还没有任何绘制指令被提交。
 
 ## 第7步：Skia提交GPU命令
 
+![alt text](image-6.png)
+
 ### 7.1 建立SkSurface
 
 ```cpp
-// frameworks/base/libs/hwui/pipeline/skia/SkiaOpenGLPipeline.cpp:116
+// frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
+void CanvasContext::draw(bool solelyTextureViewUpdates) {
+    ...
+    SkRect windowDirty = computeDirtyRect(frame, &dirty);
+    // 执行实际绘制，生成绘制结果
+    ATRACE_FORMAT("Drawing " RECT_STRING, SK_RECT_ARGS(dirty));
+    IRenderPipeline::DrawResult drawResult;
+    {
+    drawResult = mRenderPipeline->draw(
+            frame, windowDirty, dirty, mLightGeometry, &mLayerUpdateQueue,
+            mContentDrawBounds, mOpaque, mLightInfo, mRenderNodes,
+            &(profiler()), mBufferParams, profilerLock());
+    }
+    waitOnFences();
+    ...
+}
+```
+
+此处`mRenderPipeline`参考`SkiaOpenGLPipeline`
+
+```cpp
+// frameworks/base/libs/hwui/pipeline/skia/SkiaOpenGLPipeline.cpp
 IRenderPipeline::DrawResult SkiaOpenGLPipeline::draw(
         const Frame& frame, const SkRect& screenDirty, const SkRect& dirty,
         const LightGeometry& lightGeometry, LayerUpdateQueue* layerUpdateQueue,
         const Rect& contentDrawBounds, bool opaque, const LightInfo& lightInfo,
         const std::vector<sp<RenderNode>>& renderNodes, FrameInfoVisualizer* profiler,
         const HardwareBufferRenderParams& bufferParams, std::mutex& profilerLock) {
-    if (!isCapturingSkp() && !mHardwareBuffer) {
-        mEglManager.damageFrame(frame, dirty);
-    }
-    SkColorType colorType = getSurfaceColorType();
-    GrGLFramebufferInfo fboInfo;
-    fboInfo.fFBOID = 0;
-    if (colorType == kRGBA_F16_SkColorType) {
-        fboInfo.fFormat = GL_RGBA16F;
-    } else if (colorType == kN32_SkColorType) {
-        fboInfo.fFormat = GL_RGBA8;
-    } else if (colorType == kRGBA_1010102_SkColorType) {
-        fboInfo.fFormat = GL_RGB10_A2;
-    } else if (colorType == kAlpha_8_SkColorType) {
-        fboInfo.fFormat = GL_R8;
-    } else {
-        LOG_ALWAYS_FATAL("Unsupported color type.");
-    }
-    auto backendRT = GrBackendRenderTargets::MakeGL(frame.width(), frame.height(), 0,
-                                                    STENCIL_BUFFER_SIZE, fboInfo);
-    SkSurfaceProps props(mColorMode == ColorMode::Default ? 0 : SkSurfaceProps::kAlwaysDither_Flag,
-                         kUnknown_SkPixelGeometry);
-    sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(
-            mRenderThread.getGrContext(), backendRT, getSurfaceOrigin(), colorType,
-            mSurfaceColorSpace, &props);
     ...
     renderFrame(*layerUpdateQueue, dirty, renderNodes, opaque, contentDrawBounds, surface,
                 preTransform);
@@ -851,13 +975,26 @@ IRenderPipeline::DrawResult SkiaOpenGLPipeline::draw(
 }
 ```
 
-`SkSurfaces::WrapBackendRenderTarget()`把EGL当前绑定的FBO 0包装成`SkSurface`。FBO 0对应第6步dequeue出的buffer的背面缓冲。`mEglManager.damageFrame()`（604）通过`eglSetDamageRegionKHR`把脏区域告诉驱动。
+```cpp
+// frameworks/base/libs/hwui/pipeline/skia/SkiaPipeline.cpp
+void SkiaPipeline::renderFrame(const LayerUpdateQueue& layers, const SkRect& clip,
+                               const std::vector<sp<RenderNode>>& nodes, bool opaque,
+                               const Rect& contentDrawBounds, sk_sp<SkSurface> surface,
+                               const SkMatrix& preTransform) {
+    ...
+    // draw all layers up front
+    renderLayersImpl(layers, opaque);
+    renderFrameImpl(clip, nodes, opaque, contentDrawBounds, canvas, preTransform);
+    ...
+}
+```
 
 ### 7.2 遍历RenderNode树
 
-`SkiaPipeline::renderFrame()`（340）取canvas、画layer队列后调`renderFrameImpl()`（374）：
+`SkiaPipeline::renderFrame()`取canvas、画layer队列后调`renderFrameImpl()`,把RenderNode树画到SkCanvas上
 
 ```cpp
+// frameworks/base/libs/hwui/pipeline/skia/SkiaPipeline.cpp
 void SkiaPipeline::renderFrameImpl(const SkRect& clip,
                                    const std::vector<sp<RenderNode>>& nodes, bool opaque,
                                    const Rect& contentDrawBounds, SkCanvas* canvas,
@@ -882,29 +1019,88 @@ void SkiaPipeline::renderFrameImpl(const SkRect& clip,
 }
 ```
 
-DisplayList里的每条指令由`SkiaDisplayList`中的drawable重放。UI线程录制的`drawRect`、`drawPath`、`drawRenderNode`在RenderThread上翻译成`SkCanvas`调用；`drawRenderNode`对应的drawable递归进入子RenderNode，直到叶子节点的绘制指令。这一步是逐条翻译：高层绘图命令变成Skia调用，再由Ganesh后端生成GL命令。
+DisplayList里的每条指令由`SkiaDisplayList`中的drawable重放。UI线程录制的`drawRect`、`drawPath`、`drawRenderNode`在RenderThread上翻译成`SkCanvas`调用；`drawRenderNode`对应的drawable递归进入子RenderNode，直到叶子节点的绘制指令
 
 ### 7.3 提交
 
 ```cpp
-// SkiaOpenGLPipeline.cpp:182
-{
-    ATRACE_NAME("flush commands");
-    skgpu::ganesh::FlushAndSubmit(surface);
+// frameworks/base/libs/hwui/pipeline/skia/SkiaOpenGLPipeline.cpp
+IRenderPipeline::DrawResult SkiaOpenGLPipeline::draw(
+        const Frame& frame, const SkRect& screenDirty, const SkRect& dirty,
+        const LightGeometry& lightGeometry, LayerUpdateQueue* layerUpdateQueue,
+        const Rect& contentDrawBounds, bool opaque, const LightInfo& lightInfo,
+        const std::vector<sp<RenderNode>>& renderNodes, FrameInfoVisualizer* profiler,
+        const HardwareBufferRenderParams& bufferParams, std::mutex& profilerLock) {
+    ...
+    {
+        ATRACE_NAME("flush commands");
+        skgpu::ganesh::FlushAndSubmit(surface);
+    }
+    layerUpdateQueue->clear();
 }
-layerUpdateQueue->clear();
 ```
 
-`FlushAndSubmit()`把Skia累积的绘制命令flush成GPU命令并提交给驱动。提交是异步的：不等待GPU执行完。`CanvasContext::draw()`在742行调用`mRenderPipeline->draw(...)`，749行`waitOnFences()`，787行再调`mRenderPipeline->swapBuffers(...)`，790行把`drawResult.commandSubmissionTime`记到`FrameInfoIndex::CommandSubmissionCompleted`。
+`FlushAndSubmit()`把Skia累积的绘制命令flush成GPU命令并提交给驱动。提交是异步的：不等待GPU执行。`CanvasContext::draw()`调用`mRenderPipeline->draw(...)`，然后`waitOnFences()`
 
 第7步不负责把buffer交还BufferQueue，buffer仍被生产者持有；要等`swapBuffers()`调`eglSwapBuffersWithDamageKHR()`，EGL才把buffer连同GPU完成信号交给`Surface::queueBuffer()`。
 
 ## 第8步：queueBuffer与QueuedBuffer计数
 
+![alt text](image-7.png)
+
 ### 8.1 eglSwapBuffers到Surface::queueBuffer
 
+命令提交后，准备swapBuffer，据绘制结果和EGL状态决定是否把本帧缓冲区提交给系统
+
 ```cpp
-// frameworks/base/libs/hwui/renderthread/EglManager.cpp:621
+void CanvasContext::draw(bool solelyTextureViewUpdates) {
+    ...
+    bool requireSwap = false;
+    bool didSwap = mRenderPipeline->swapBuffers(
+            frame, drawResult, windowDirty, mCurrentFrameInfo, &requireSwap);
+    ...
+    // 处理Swap结果
+    if (requireSwap) {
+        ...
+        if (error == TIMED_OUT) {
+            mRenderThread.postFrameCallback(this);
+        } else if (error != OK || !didSwap) {
+            setSurface(nullptr);
+        }
+        ..
+    }
+    mCurrentFrameInfo->markSwapBuffersCompleted();
+    // 通知帧提交回调
+    if (didSwap) {
+        for (auto& func : mFrameCommitCallbacks) {
+            std::invoke(func, true);
+        }
+        mFrameCommitCallbacks.clear();
+    }
+    ...
+}
+```
+
+```cpp
+// frameworks/base/libs/hwui/pipeline/skia/SkiaOpenGLPipeline.cpp
+bool SkiaOpenGLPipeline::swapBuffers(const Frame& frame, IRenderPipeline::DrawResult& drawResult,
+                                     const SkRect& screenDirty, FrameInfo* currentFrameInfo,
+                                     bool* requireSwap) {
+    GL_CHECKPOINT(LOW);
+    currentFrameInfo->markSwapBuffers();
+    if (mHardwareBuffer) {
+        return false;
+    }
+    *requireSwap = drawResult.success || mEglManager.damageRequiresSwap();
+    if (*requireSwap && (CC_UNLIKELY(!mEglManager.swapBuffers(frame, screenDirty)))) {
+        return false;
+    }
+    return *requireSwap;
+}
+```
+
+```cpp
+// frameworks/base/libs/hwui/renderthread/EglManager.cpp
 bool EglManager::swapBuffers(const Frame& frame, const SkRect& screenDirty) {
     if (CC_UNLIKELY(Properties::waitForGpuCompletion)) {
         ATRACE_NAME("Finishing GPU work");
@@ -917,10 +1113,10 @@ bool EglManager::swapBuffers(const Frame& frame, const SkRect& screenDirty) {
 }
 ```
 
-`eglSwapBuffersWithDamageKHR()`由EGL驱动实现，最终调`ANativeWindow_queueBuffer()`，进入`Surface::hook_queueBuffer()`（614），再转成内部类型：
+`eglSwapBuffersWithDamageKHR()`由EGL驱动实现，最终调`ANativeWindow_queueBuffer()`，进入`Surface::hook_queueBuffer()`，再转成内部类型：
 
 ```cpp
-// frameworks/native/libs/gui/Surface.cpp:614
+// frameworks/native/libs/gui/Surface.cpp
 int Surface::hook_queueBuffer(ANativeWindow* window,
         ANativeWindowBuffer* buffer, int fenceFd) {
     Surface* c = getSelf(window);
@@ -930,22 +1126,68 @@ int Surface::hook_queueBuffer(ANativeWindow* window,
 ```
 
 ```cpp
-// Surface.cpp:1480
+// frameworks/native/libs/gui/Surface.cpp
 status_t Surface::queueBuffer(const sp<GraphicBuffer>& buffer, const sp<Fence>& fence,
                               SurfaceQueueBufferOutput* surfaceOutput) {
+    ATRACE_CALL();
+    SURF_LOGV("Surface::queueBuffer");
     return queueBufferImpl(buffer, fence, nullptr, surfaceOutput);
 }
 ```
 
-`queueBufferImpl()`（1330）先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队。`queueBuffer()`返回时并不等它：除非`Properties::waitForGpuCompletion`为true（调试用），`swapBuffers()`不会`eglClientWaitSyncKHR`。消费者拿到的acquire fence会替它等。
+```cpp
+// frameworks/native/libs/gui/Surface.cpp
+status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fence>& fence,
+                                  const SurfaceQueueBufferInput* maybeSurfaceInput,
+                                  SurfaceQueueBufferOutput* surfaceOutput) {
+
+    ...
+    slot = getSlotFromBufferLocked(buffer);
+    if (slot < 0) {
+        return slot;
+    }
+    ...
+    status_t err = mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput);
+    ...
+}
+```
+
+```cpp
+// frameworks/native/libs/gui/IGraphicBufferProducer.cpp
+virtual status_t queueBuffer(int buf,
+        const QueueBufferInput& input, QueueBufferOutput* output) {
+    ...
+    status_t result = remote()->transact(QUEUE_BUFFER, data, &reply);
+    ...
+}
+```
+
+`queueBufferImpl()`先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队。`queueBuffer()`返回时并不等它：除非`Properties::waitForGpuCompletion`为true。消费者拿到的acquire fence会替它等。
 
 ### 8.2 queueBuffer与onFrameAvailable
 
-`BBQBufferQueueProducer`没有重写`queueBuffer()`，走`BufferQueueProducer::queueBuffer()`：标记`QUEUED`、记录frame number、更新`FrameEventHistory`，然后回调consumer listener。`BLASTBufferQueue::initialize()`在205行把`mBufferItemConsumer`的listener设为BBQ自己：
+`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`
+
+`BBQBufferQueueProducer`没有重写`queueBuffer()`，走`BufferQueueProducer::queueBuffer()`：标记`QUEUED`、记录frame number、更新`FrameEventHistory`，然后回调consumer listener。`BLASTBufferQueue::initialize()`把`mBufferItemConsumer`的listener设为BBQ自己：
 
 ```cpp
-// BLASTBufferQueue.cpp:205
+// frameworks/native/libs/gui/BLASTBufferQueue.cpp
 mBufferItemConsumer->setFrameAvailableListener(wp<BLASTBufferQueue>::fromExisting(this));
+```
+
+```cpp
+// frameworks/native/libs/gui/BufferQueueProducer.cpp
+status_t BufferQueueProducer::queueBuffer(int slot,
+        const QueueBufferInput &input, QueueBufferOutput *output) {
+    ATRACE_CALL();
+    ATRACE_BUFFER_INDEX(slot);
+    sp<Fence> acquireFence;
+    ...
+    mSlots[slot].mFence = acquireFence; 
+    mSlots[slot].mBufferState.queue();
+    ...
+    frameAvailableListener->onFrameAvailable(item);
+}
 ```
 
 于是落到`BLASTBufferQueue::onFrameAvailable()`。
@@ -953,20 +1195,24 @@ mBufferItemConsumer->setFrameAvailableListener(wp<BLASTBufferQueue>::fromExistin
 ### 8.3 onFrameAvailable里的计数
 
 ```cpp
-// frameworks/native/libs/gui/BLASTBufferQueue.cpp:779
+// frameworks/native/libs/gui/BLASTBufferQueue.cpp
 void BLASTBufferQueue::onFrameAvailable(const BufferItem& item) {
     ...
     {
         UNIQUE_LOCK_WITH_ASSERTION(mMutex);
+        BBQ_TRACE();
         bool waitForTransactionCallback = !mSyncedFrameNumbers.empty();
         ...
         mNumFrameAvailable++;
         if (waitForTransactionCallback && mNumFrameAvailable >= 2) {
             acquireAndReleaseBuffer();
         }
+        // mQueuedBufferTrace = "QueuedBuffer - " + mName + "BLAST#" + std::to_string(mProducerId);
         ATRACE_INT(mQueuedBufferTrace.c_str(),
                    mNumFrameAvailable + mNumAcquired - mPendingRelease.size());
         ...
+        if (syncTransactionSet) {
+            ...
         } else if (!waitForTransactionCallback) {
             acquireNextBufferLocked(std::nullopt);
         }
@@ -974,15 +1220,11 @@ void BLASTBufferQueue::onFrameAvailable(const BufferItem& item) {
 }
 ```
 
-计数名在`initialize()`里拼出（`BLASTBufferQueue.cpp:203`）：
+Perfetto里看到的是`QueuedBuffer - VRIBLAST#N`。值是`mNumFrameAvailable + mNumAcquired - mPendingRelease.size()`，含义是App已queue、尚未被SurfaceFlinger释放回去的buffer总数，不是BufferQueue内部队列长度。
 
-```cpp
-mQueuedBufferTrace = "QueuedBuffer - " + mName + "BLAST#" + std::to_string(mProducerId);
-```
+`mNumFrameAvailable`在queue时+1，在`acquireNextBufferLocked`中-1；`mNumAcquired`在`acquireNextBufferLocked`中+1，在`releaseBuffer()`里-1
 
-普通窗口的`mName`形如`VRI`，producer id是自增整数，systrace里看到的是`QueuedBuffer - VRIBLAST#N`。值是`mNumFrameAvailable + mNumAcquired - mPendingRelease.size()`，含义是“App已queue、尚未被SurfaceFlinger释放回去的buffer总数”，不是BufferQueue内部队列长度。`mNumFrameAvailable`在queue时+1，`mNumAcquired`在acquire时+1，`releaseBuffer()`里`mNumAcquired--`。
-
-`mNumAcquired`不能超过`mMaxAcquiredBuffers + 2`。`acquireNextBufferLocked()`开头就做这两项检查，超过时返回`NO_BUFFER_AVAILABLE`，`onFrameAvailable()`在条件变量上等待。这是BLAST控制延迟的手段。
+`mNumAcquired`不能超过`mMaxAcquiredBuffers + 2`。`acquireNextBufferLocked()`开头就做这两项检查，超过时返回`NO_BUFFER_AVAILABLE`，`onFrameAvailable()`在条件变量上等待
 
 ## 第9步：BLAST Consumer把buffer提交给SurfaceFlinger
 
