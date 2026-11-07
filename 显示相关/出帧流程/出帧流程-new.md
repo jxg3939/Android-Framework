@@ -884,7 +884,38 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
 }
 ```
 
-`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`
+
+```cpp
+virtual status_t dequeueBuffer(int* buf, sp<Fence>* fence, uint32_t width, uint32_t height,
+                                PixelFormat format, uint64_t usage, uint64_t* outBufferAge,
+                                FrameEventHistoryDelta* outTimestamps) {
+    ...
+    status_t result = remote()->transact(DEQUEUE_BUFFER, data, &reply);
+    if (result != NO_ERROR) {
+        return result;
+    }
+    *buf = reply.readInt32();
+    *fence = sp<Fence>::make();
+    result = reply.read(**fence);
+    return result;
+}
+```
+
+`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`，`dequeueBuffer`在`BLASTBufferQueue`未实现，调用BufferQueueProducer的dequeueBuffer
+
+
+```cpp
+status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* outFence,
+                                            uint32_t width, uint32_t height, PixelFormat format,
+                                            uint64_t usage, uint64_t* outBufferAge,
+                                            FrameEventHistoryDelta* outTimestamps) {
+    ATRACE_CALL();
+    ...
+    mSlots[found].mBufferState.dequeue();
+    ...
+    addAndGetFrameTimestamps(nullptr, outTimestamps);
+}    
+```
 
 ### 6.3 什么时候会在这里等待
 
@@ -1189,8 +1220,9 @@ status_t BufferQueueProducer::queueBuffer(int slot,
     frameAvailableListener->onFrameAvailable(item);
 }
 ```
+`BufferQueueProducer::queueBuffer`中完成了对`BufferItem`的包装，`BufferItem`包含了缓冲区的句柄以及所有相关的元数据，如mGraphicBuffer, mFence, mSlot, mFrameNumber
 
-于是落到`BLASTBufferQueue::onFrameAvailable()`。
+`queueBuffer`落到`BLASTBufferQueue::onFrameAvailable()`。
 
 ### 8.3 onFrameAvailable里的计数
 
