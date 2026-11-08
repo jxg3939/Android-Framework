@@ -268,6 +268,37 @@ void updateBlastSurfaceIfNeeded() {
 当App需要进行UI绘制的时候，只需要通过Surface的IGraphicBufferProducer(IGBP)从BLASTBufferQueue中申请一块GraphicBuffer，如果BLASTBufferQueue中没有可用的内存，那么就会通过Gralloc分配一块Buffer，然后把App把UI绘制到这一块GraphicBuffer中，最后由BLASTBufferQueue提交给SurfaceFlinger去做进一步合成
 
 
+### 2.3
+```cpp
+// frameworks/native/libs/gui/include/gui/IGraphicBufferProducer.h
+#ifndef NO_BINDER
+class BnGraphicBufferProducer : public BnInterface<IGraphicBufferProducer>
+{
+public:
+    virtual status_t    onTransact( uint32_t code,
+                                    const Parcel& data,
+                                    Parcel* reply,
+                                    uint32_t flags = 0);
+};
+#else
+class BnGraphicBufferProducer : public IGraphicBufferProducer {
+};
+#endif
+
+// frameworks/native/libs/gui/include/gui/BufferQueueProducer.h
+#ifndef NO_BINDER
+class BufferQueueProducer : public BnGraphicBufferProducer,
+                            private IBinder::DeathRecipient {}
+#else
+class BufferQueueProducer : public BnGraphicBufferProducer {}
+#endif
+
+// frameworks/native/libs/gui/BLASTBufferQueue.cpp
+class BBQBufferQueueProducer : public BufferQueueProducer {}
+```
+
+
+
 ## 3.BlastBufferQueue下buffer的使用
 
 要明确的一点是，BlastBufferQueue并不是一个全新的BufferQueue，之前使用的BufferQueue仍然保留，其核心使用逻辑并没有变，只是从由SurfaceFlinger管理BufferQueue，变成了应用进程管理BlastBufferQueue

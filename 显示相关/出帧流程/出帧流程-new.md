@@ -745,68 +745,11 @@ void CanvasContext::draw(bool solelyTextureViewUpdates) {
     SkRect dirty;
     mDamageAccumulator.finish(&dirty);
     ...
-    // 判断是否跳过本帧绘制
-    const auto skippedFrameReason = [&]() -> std::optional<SkippedFrameReason> {
-        if (!Properties::isDrawingEnabled() || !mDrawingEnabled) {
-            return SkippedFrameReason::DrawingOff;
-        }
-        if (dirty.isEmpty() && Properties::skipEmptyFrames && !surfaceRequiresRedraw()) {
-            return SkippedFrameReason::NothingToDraw;
-        }
-        return std::nullopt;
-    }();
-    if (skippedFrameReason) {
-        // 跳过绘制，通知回调本帧没有产生 Buffer
-        ...
-        waitOnFences();
-        for (auto& func : mFrameCommitCallbacks) {
-            std::invoke(func, false);
-        }
-        mFrameCommitCallbacks.clear();
-        return;
-    }
-    ScopedActiveContext activeContext(this);
     // 初始化帧信息，获取当前 Frame
     mCurrentFrameInfo->set(FrameInfoIndex::FrameInterval) =
             mRenderThread.timeLord().frameIntervalNanos();
     mCurrentFrameInfo->markIssueDrawCommandsStart();
     Frame frame = getFrame();
-    SkRect windowDirty = computeDirtyRect(frame, &dirty);
-    // 执行实际绘制，生成绘制结果
-    ATRACE_FORMAT("Drawing " RECT_STRING, SK_RECT_ARGS(dirty));
-    IRenderPipeline::DrawResult drawResult;
-    {
-    drawResult = mRenderPipeline->draw(
-            frame, windowDirty, dirty, mLightGeometry, &mLayerUpdateQueue,
-            mContentDrawBounds, mOpaque, mLightInfo, mRenderNodes,
-            &(profiler()), mBufferParams, profilerLock());
-    }
-    uint64_t frameCompleteNr = getFrameNumber();
-    waitOnFences();
-    ...
-    // 执行Buffer Swap，将绘制结果提交到Surface
-    bool requireSwap = false;
-    bool didSwap = mRenderPipeline->swapBuffers(
-            frame, drawResult, windowDirty, mCurrentFrameInfo, &requireSwap);
-    ...
-    // 处理Swap结果
-    if (requireSwap) {
-        ...
-        if (error == TIMED_OUT) {
-            mRenderThread.postFrameCallback(this);
-        } else if (error != OK || !didSwap) {
-            setSurface(nullptr);
-        }
-        ..
-    }
-    mCurrentFrameInfo->markSwapBuffersCompleted();
-    // 通知帧提交回调
-    if (didSwap) {
-        for (auto& func : mFrameCommitCallbacks) {
-            std::invoke(func, true);
-        }
-        mFrameCommitCallbacks.clear();
-    }
     ...
 }
 ```
@@ -839,42 +782,33 @@ int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buf
 
 ```text
 window->dequeueBuffer(window, &buf, &fence)   // ANativeWindow_dequeueBuffer
+       ->Surface::hook_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd)
         ->Surface::dequeueBuffer(sp<GraphicBuffer>*, int*)
-         -> IGraphicBufferProducer::dequeueBuffer  这里Binder调用还在本进程内
            ->BBQBufferQueueProducer::dequeueBuffer  未实现，调用BufferQueueProducer的dequeueBuffer
             ->BufferQueueProducer::dequeueBuffer
 ```
 
-### 6.2 Surface::dequeueBuffer
+### 6.2 dequeueBuffer
 
 ```cpp
 // frameworks/native/libs/gui/Surface.cpp
-status_t Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, sp<Fence>* outFence) {
-    if (buffer == nullptr || outFence == nullptr) {
-        return BAD_VALUE;
-    }
-    sp<GraphicBuffer> tmpBuffer;
-    int fd = -1;
-    status_t res = dequeueBuffer(&tmpBuffer, &fd);
-    if (res != NO_ERROR) {
-        SURF_LOGV("dequeueBuffer() returned %d", res);
-        return res;
-    }
-    *buffer = tmpBuffer;
-    *outFence = sp<Fence>::make(fd);
-    return res;
+int Surface::hook_dequeueBuffer(ANativeWindow* window,
+        ANativeWindowBuffer** buffer, int* fenceFd) {
+    ...
+    sp<GraphicBuffer> graphicBuffer;
+    status_t result = c->dequeueBuffer(&graphicBuffer, fenceFd);
+    *buffer = graphicBuffer.get();
+    return result;
 }
-
-内部转发
 
 int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
     {
         std::scoped_lock _dl(mDebugMutex);
         ATRACE_FORMAT("dequeueBuffer - %s", mDebugName.c_str());
     }
+    SURF_LOGV("Surface::dequeueBuffer");
     ...
-    int buf = -1;
-    sp<Fence> fence;
+    // BLAST下Surface实例通常是BBQSurface，它的mGraphicBufferProducer来源于BLASTBufferQueue::createBufferQueue，该方法内部会创建BBQBufferQueueProducer作为生产者实体，这个指针实际指向的是本进程内的BBQBufferQueueProducer对象
     status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence, dqInput.width,
                                                             dqInput.height, dqInput.format,
                                                             dqInput.usage, &mBufferAge,
@@ -884,25 +818,7 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
 }
 ```
 
-
-```cpp
-virtual status_t dequeueBuffer(int* buf, sp<Fence>* fence, uint32_t width, uint32_t height,
-                                PixelFormat format, uint64_t usage, uint64_t* outBufferAge,
-                                FrameEventHistoryDelta* outTimestamps) {
-    ...
-    status_t result = remote()->transact(DEQUEUE_BUFFER, data, &reply);
-    if (result != NO_ERROR) {
-        return result;
-    }
-    *buf = reply.readInt32();
-    *fence = sp<Fence>::make();
-    result = reply.read(**fence);
-    return result;
-}
-```
-
-`mGraphicBufferProducer`指向`BLASTBufferQueue`创建的`BufferQueue`的producer。它用的是自定义的`BBQBufferQueueProducer`，`dequeueBuffer`在`BLASTBufferQueue`未实现，调用BufferQueueProducer的dequeueBuffer
-
+`dequeueBuffer`在`BLASTBufferQueueProducer`中未实现，调用`BufferQueueProducer`的`dequeueBuffer`
 
 ```cpp
 status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* outFence,
@@ -1178,22 +1094,14 @@ status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fenc
         return slot;
     }
     ...
+    //  BLAST下Surface实例通常是BBQSurface，它的mGraphicBufferProducer来源于BLASTBufferQueue::createBufferQueue，该方法内部会创建BBQBufferQueueProducer作为生产者实体，这个指针实际指向的是本进程内的BBQBufferQueueProducer对象
     status_t err = mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput);
     ...
 }
 ```
 
-```cpp
-// frameworks/native/libs/gui/IGraphicBufferProducer.cpp
-virtual status_t queueBuffer(int buf,
-        const QueueBufferInput& input, QueueBufferOutput* output) {
-    ...
-    status_t result = remote()->transact(QUEUE_BUFFER, data, &reply);
-    ...
-}
-```
-
 `queueBufferImpl()`先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队。`queueBuffer()`返回时并不等它：除非`Properties::waitForGpuCompletion`为true。消费者拿到的acquire fence会替它等。
+
 
 ### 8.2 queueBuffer与onFrameAvailable
 
@@ -1217,9 +1125,13 @@ status_t BufferQueueProducer::queueBuffer(int slot,
     mSlots[slot].mFence = acquireFence; 
     mSlots[slot].mBufferState.queue();
     ...
+    addAndGetFrameTimestamps(&newFrameEventsEntry,
+            getFrameTimestamps ? &output->frameTimestamps : nullptr);
+    ...
     frameAvailableListener->onFrameAvailable(item);
 }
 ```
+
 `BufferQueueProducer::queueBuffer`中完成了对`BufferItem`的包装，`BufferItem`包含了缓冲区的句柄以及所有相关的元数据，如mGraphicBuffer, mFence, mSlot, mFrameNumber
 
 `queueBuffer`落到`BLASTBufferQueue::onFrameAvailable()`。
