@@ -1,4 +1,4 @@
-# 出帧流程
+﻿# 出帧流程
 
 本文按13个步骤展开一帧从App主线程到屏幕上屏的完整路径。类名、方法名、行号取自`android-17.0.0_r1`（<https://cs.android.com/android/platform/superproject/+/android-17.0.0_r1>），抓取时间2026-11，行号会随提交变化，引用时以方法名为准。
 
@@ -1226,12 +1226,13 @@ Perfetto里看到的是`QueuedBuffer - VRIBLAST#N`。值是`mNumFrameAvailable +
 
 ## 第9步：BLAST Consumer把buffer提交给SurfaceFlinger
 
+![alt text](image-8.png)
+
 ### 9.1 acquire并setBuffer
 
 ```cpp
-// frameworks/native/libs/gui/BLASTBufferQueue.cpp:567
-status_t BLASTBufferQueue::acquireNextBufferLocked(
-        const std::optional<SurfaceComposerClient::Transaction*> transaction) {
+// frameworks/native/libs/gui/BLASTBufferQueue.cpp
+status_t BLASTBufferQueue::acquireNextBufferLocked(const std::optional<SurfaceComposerClient::Transaction*> transaction) {
     if (mNumFrameAvailable == 0) {
         return BufferQueue::NO_BUFFER_AVAILABLE;
     }
@@ -1244,8 +1245,7 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(
     SurfaceComposerClient::Transaction* t = &localTransaction;
     ...
     BufferItem bufferItem;
-    status_t status =
-            mBufferItemConsumer->acquireBuffer(&bufferItem, 0 /* expectedPresent */, false);
+    status_t status = mBufferItemConsumer->acquireBuffer(&bufferItem, 0 /* expectedPresent */, false);
     ...
     auto buffer = bufferItem.mGraphicBuffer;
     mNumFrameAvailable--;
@@ -1255,8 +1255,7 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(
     mSubmitted.emplace_or_replace(releaseCallbackId, bufferItem);
     ...
     auto releaseBufferCallback = makeReleaseBufferCallbackThunk();
-    sp<Fence> fence =
-            bufferItem.mFence ? sp<Fence>::make(bufferItem.mFence->dup()) : Fence::NO_FENCE;
+    sp<Fence> fence = bufferItem.mFence ? sp<Fence>::make(bufferItem.mFence->dup()) : Fence::NO_FENCE;
     t->setBuffer(mSurfaceControl, buffer, fence, bufferItem.mFrameNumber, mProducerId,
                  releaseBufferCallback, dequeueTime);
     t->setDataspace(...);
@@ -1269,6 +1268,7 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(
         mAppliedLastTransaction = true;
         mLastAppliedFrameNumber = bufferItem.mFrameNumber;
     } else {
+        // 等同一Surface上帧号为mLastAppliedFrameNumber的buffer
         t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber);
         mAppliedLastTransaction = false;
     }
@@ -1276,31 +1276,113 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(
 }
 ```
 
-逐点：
-
 - `acquireBuffer()`拿到`BufferItem`，其`mFence`就是生产者queue时的GPU完成fence，在SurfaceFlinger侧作为acquire fence。
 - `mNumFrameAvailable--`、`mNumAcquired++`：从“可用”变成“已acquire”。
 - `mSubmitted[ReleaseCallbackId(buffer->getId(), frameNumber)]`记录buffer id和frame number，SF释放时用这个映射找回`BufferItem`。
 - `setBuffer()`写入buffer和acquire fence，并带上第13步要用的`releaseBufferCallback`。
 - `setDataspace()`、`setHdrMetadata()`、`setSurfaceDamageRegion()`在同一个事务里提交数据空间、HDR元数据、脏区域。
 - `addTransactionCompletedCallback()`注册事务完成回调，供`TransactionCompletedListener`使用。
-- `setApplyToken(mApplyToken).apply(false, true)`：第二个参数`synchronous=false`、第三个参数`oneWay=true`，单向Binder调用，不等SurfaceFlinger返回。
+- `setApplyToken(mApplyToken).apply(false, true)`：token让SF按队列排序，`synchronous=false`不等提交完成，`oneWay=true`走单向Binder，详见9.2。
+- `t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber)`等待在`mLastAppliedFrameNumber`对应的buffer完成后再应用事务
 
-### 9.2 apply之后：BufferTX计数
+### 9.2 apply：从客户端到SF的事务队列
 
-事务经`ISurfaceComposerClient`送到SurfaceFlinger，Binder线程进入`setTransactionState()`。带buffer的transaction在这里给`BufferTX`计数+1：
+`setApplyToken(mApplyToken)`只是把token存进`Transaction`，真正的提交在`apply(false, true)`
 
 ```cpp
-// frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp:5649
+status_t Transaction::apply(bool synchronous, bool oneWay) {
+    ...
+    cacheBuffers();                       // BufferCache 命中就把 buffer 换成 cacheId
+    if (oneWay && !synchronous) {
+        mState.mFlags |= ISurfaceComposer::eOneWay;
+    }
+    sp<IBinder> applyToken = mApplyToken ? mApplyToken : getDefaultApplyToken();
+    sp<ISurfaceComposer> sf(ComposerService::getComposerService());
+    TransactionState state = std::move(mState);
+    status_t binderStatus = sf->setTransactionState(std::move(state), applyToken);
+    clear();
+    ...
+}
+```
+
+两个参数`synchronous=false`：不注册`SyncCallback`，不等事务提交完成；`oneWay=true`：给`mState.mFlags`置`ISurfaceComposer::eOneWay`，Binder proxy据此用`FLAG_ONEWAY`发起transact；然后`sf->setTransactionState(std::move(state), applyToken)`，`clear()`后返回
+
+```cpp
+// frameworks/native/libs/gui/ISurfaceComposer.cpp
+status_t BpSurfaceComposer::setTransactionState(TransactionState&& state, const sp<IBinder>& applyToken) {
+    ...
+    if (state.mFlags & ISurfaceComposer::eOneWay) {
+        return remote()->transact(BnSurfaceComposer::SET_TRANSACTION_STATE, data, &reply,
+                                  IBinder::FLAG_ONEWAY);
+    } else {
+        return remote()->transact(BnSurfaceComposer::SET_TRANSACTION_STATE, data, &reply);
+    }
+}
+```
+
+接口是`ISurfaceComposer`，到了SF，Binder线程进入`SurfaceFlinger::setTransactionState()`，
+
+### 9.3 SurfaceFlinger::setTransactionState()
+
+`setTransactionState()`这个操作并不在SurfaceFlinger主线程上，而是在一个Binder线程上
+
+主要做以下几件事：
+
+- 识别调用者并裁剪权限：读取getCallingPid/Uid，对每个`layer_state_t`、`display_state`执行`sanitize(permissions)`，把无权改的字段静默抹掉
+- 处理buffer缓存：按`uncacheBuffers`调用`ClientCache::erase()`，释放客户端不再需要的cache条目
+- 所有的`transactionState.mComposerStates`解析成`ResolvedComposerState`，成功后执行mBufferCountTracker.increment()，`BufferTX -`计数+1
+- 封装`QueuedTransactionState`，`frameTimelineInfo`、`resolvedStates`、`flags`、`applyToken`、等等全部封装进`QueuedTransactionState`
+- `QueuedTransactionState`进入无锁队列：mTransactionHandler.queueTransaction()只做push和`PendingTransactionCount`计数，不会被主线程commit阻塞Binder线程；oneway下客户端连这一步的返回都不等
+- `setTransactionFlags()`
+
+### 9.5 setTransactionFlags()
+
+```cpp
+void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
+                                         FrameHint frameHint,
+                                         std::vector<gui::EarlyWakeupInfo> earlyWakeupInfos) {
+    mScheduler->modulateVsync({}, &VsyncModulator::setTransactionSchedule, schedule,
+                              std::move(earlyWakeupInfos));
+    uint32_t transactionFlags = mTransactionFlags.fetch_or(mask);
+    SFTRACE_INT("mTransactionFlags", transactionFlags);
+    if (const bool scheduled = transactionFlags & mask; !scheduled) {
+        mScheduler->resync(IEventThreadCallback::ResyncCaller::Transaction);
+        scheduleCommit(frameHint);
+    } else if (frameHint == FrameHint::kActive) {
+        // Even if the next frame is already scheduled, we should reset the idle timer as a new activity just happened.
+        mScheduler->resetAllIdleTimers();
+    }
+}
+```
+
+1. `modulateVsync()`用于调整VSync调度策略，决定SF提前/延后多久醒
+2. Binder线程`fetch_or(mask)`置位，SF主线程`commit()`里 `clearTransactionFlags(mask)` 取走，并据此决定`flushTransactions`。`fetch_or(mask)`的返回值是旧值，`transactionFlags & mask` 为 0 说明之前没排过，才需要真正叫醒 SF；否则说明已经有在途调度，不重复排，新事务会被已经排好的那一帧一起flush掉，同一帧内不管来多少笔事务（多个 App、同一 App多次apply），只有第一笔会触发`resync` + `scheduleCommit`，后面的只置位
+3. 如果没有被排过走`resync() + scheduleCommit()`:`resync()`:由于SF是被外部事务叫醒的，可能已经偏离预测的Vsync时间轴，所以要拿硬件Vsync重新对齐预测器;`scheduleCommit()`:最终落到`mScheduler->scheduleFrame()`
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp
+const auto workDuration = Duration(mVsync.workDuration.get() - workDurationSlack);
+mVsync.scheduledFrameTimeOpt =
+        mVsync.registration->schedule({.workDuration = workDuration.ns(),
+                                       .readyDuration = 0,
+                                       .lastVsync = mVsync.lastCallbackTime.ns()});
+```
+
+用`VSyncDispatch`按下一个Vsync − workDuration的时间唤醒定时器，到点回调`MessageQueue::vsyncCallback()`唤醒SF工作
+4. 如果被排过了，还是要走`mScheduler->resetAllIdleTimers()`，保证这帧不会被Display显示器的idle状态拖住
+
+### 9.4 BufferTX计数
+
+带buffer的transaction在`SurfaceFlinger::setTransactionState()`（Binder线程）里给`BufferTX`计数+1：
+
+```cpp
+// frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 if (resolvedState.state.hasBufferChanges() && resolvedState.state.hasValidBuffer() &&
     resolvedState.state.surface) {
     ...
     mBufferCountTracker.increment(resolvedState.layerId);
 }
-```
-
-```cpp
-// frameworks/native/services/surfaceflinger/SurfaceFlinger.h:425
+// frameworks/native/services/surfaceflinger/SurfaceFlinger.h
 void increment(uint32_t layerId) {
     std::lock_guard<std::mutex> lock(mLock);
     auto it = mCounterByLayerId.find(layerId);
@@ -1314,14 +1396,13 @@ void increment(uint32_t layerId) {
 }
 ```
 
-名字在`Layer.h:556`拼出：`const std::string mBlastTransactionName{"BufferTX - " + mName};`。`BufferTX - <layerName>`在Binder线程收到带buffer的transaction时+1，在`Layer::gatherBufferInfo()`latch新buffer时-1，或在`Layer::releasePreviousBuffer()`丢弃旧buffer时-1，反映“已到达SF但未latch的buffer数”。
+name为`const std::string mBlastTransactionName{"BufferTX - " + mName};`，`BufferTX - <layerName>`在Binder线程收到带buffer的transaction时+1，在`Layer::gatherBufferInfo()`latch新buffer时-1，或在`Layer::releasePreviousBuffer()`丢弃旧buffer时-1，反映“已到达SF但未latch的buffer数”。
 
-### 9.3 这一步结束时
+### 9.5 这一步结束时
 
 - buffer所有权已通过`Transaction`交给SurfaceFlinger的待处理事务队列。
 - SF还没应用事务，`Layer::mDrawingState.buffer`未更新。
-- `BufferTX`已+1，`QueuedBuffer`保持“App侧未释放”的值。
-- App的`mSubmitted`保留`BufferItem`，等待第13步release回调。
+- `BufferTX`已+1
 
 ## 第10步：vsync-sf触发SurfaceFlinger出帧
 
@@ -1333,8 +1414,7 @@ SurfaceFlinger的Vsync由`VSyncDispatchTimerQueue`按预测时间提前`workDura
 // frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp:90
 ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTiming timing,
                                                       VSyncTracker& tracker, nsecs_t now) {
-    auto nextVsyncTime =
-            tracker.nextAnticipatedVSyncTimeFrom(std::max(timing.lastVsync,
+    auto nextVsyncTime = tracker.nextAnticipatedVSyncTimeFrom(std::max(timing.lastVsync,
                                                           now + timing.workDuration +
                                                                   timing.readyDuration),
                                                  timing.committedVsyncOpt.value_or(
