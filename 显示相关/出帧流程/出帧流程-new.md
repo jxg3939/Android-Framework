@@ -794,13 +794,40 @@ window->dequeueBuffer(window, &buf, &fence)   // ANativeWindow_dequeueBuffer
 // frameworks/native/libs/gui/Surface.cpp
 int Surface::hook_dequeueBuffer(ANativeWindow* window,
         ANativeWindowBuffer** buffer, int* fenceFd) {
-    ...
+    Surface* c = getSelf(window);
+    // 拦截器路径
+    {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mDequeueInterceptor != nullptr) {
+            auto interceptor = c->mDequeueInterceptor;
+            auto data = c->mDequeueInterceptorData;
+            return interceptor(window, Surface::dequeueBufferInternal, data, buffer, fenceFd);
+        }
+    }
     sp<GraphicBuffer> graphicBuffer;
     status_t result = c->dequeueBuffer(&graphicBuffer, fenceFd);
     *buffer = graphicBuffer.get();
     return result;
 }
+```
 
+拦截器中正常走落到`dequeueBufferInternal`
+
+```cpp
+int Surface::dequeueBufferInternal(ANativeWindow* window, ANativeWindowBuffer** buffer,
+                                   int* fenceFd) {
+    Surface* c = getSelf(window);
+
+    sp<GraphicBuffer> graphicBuffer;
+    status_t result = c->dequeueBuffer(&graphicBuffer, fenceFd);
+    *buffer = graphicBuffer.get();
+    return result;
+}
+```
+
+走拦截器也就是多一步调用，最终还是落到`Surface::dequeueBuffer`
+
+```cpp
 int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
     {
         std::scoped_lock _dl(mDebugMutex);
@@ -873,7 +900,7 @@ status_t waitForBufferRelease(std::unique_lock<std::mutex>& bufferQueueLock,
 
 `mBufferReleaseReader`读`BufferReleaseChannel`，SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`，channel有数据后`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值，默认无限等待。
 
-### 6.4 本步拿到的两样东西
+### 6.4 本步拿到的两样关键东西
 
 - 一个空闲slot对应的`GraphicBuffer`。
 - 该buffer从消费者侧继承的release fence（`fenceFd`）。EGL开始往这块buffer画之前必须等它，保证上一轮使用者已读完。
@@ -1062,15 +1089,43 @@ bool EglManager::swapBuffers(const Frame& frame, const SkRect& screenDirty) {
 
 `eglSwapBuffersWithDamageKHR()`由EGL驱动实现，最终调`ANativeWindow_queueBuffer()`，进入`Surface::hook_queueBuffer()`，再转成内部类型：
 
+```text
+window->queueBuffer(window, buffer, fenceFd)   // ANativeWindow_queueBuffer
+  ->Surface::hook_queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
+        ->Surface::queueBuffer(const sp<GraphicBuffer>&, const sp<Fence>&, SurfaceQueueBufferOutput*)
+          ->Surface::queueBufferImpl()
+              ->BufferQueueProducer::queueBuffer()   // BBQ 未重写
+```
+
+
 ```cpp
 // frameworks/native/libs/gui/Surface.cpp
 int Surface::hook_queueBuffer(ANativeWindow* window,
         ANativeWindowBuffer* buffer, int fenceFd) {
     Surface* c = getSelf(window);
-    ...
+    // 拦截器路径
+    {
+        std::shared_lock<std::shared_mutex> lock(c->mInterceptorMutex);
+        if (c->mQueueInterceptor != nullptr) {
+            auto interceptor = c->mQueueInterceptor;
+            auto data = c->mQueueInterceptorData;
+            return interceptor(window, Surface::queueBufferInternal, data, buffer, fenceFd);
+        }
+    }
     return c->queueBuffer(GraphicBuffer::from(buffer), sp<Fence>::make(fenceFd));
 }
 ```
+
+拦截器中正常走落到`queueBufferInternal`
+
+```cpp
+int Surface::queueBufferInternal(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd) {
+    Surface* c = getSelf(window);
+    return c->queueBuffer(GraphicBuffer::from(buffer), sp<Fence>::make(fenceFd));
+}
+```
+
+正常路径下走拦截器也就是多一步调用，最终还是落到`Surface::queueBuffer`
 
 ```cpp
 // frameworks/native/libs/gui/Surface.cpp
@@ -1101,7 +1156,6 @@ status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fenc
 ```
 
 `queueBufferImpl()`先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队。`queueBuffer()`返回时并不等它：除非`Properties::waitForGpuCompletion`为true。消费者拿到的acquire fence会替它等。
-
 
 ### 8.2 queueBuffer与onFrameAvailable
 
