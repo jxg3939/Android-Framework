@@ -15,7 +15,7 @@
 |7|RenderThread+GPU|`SkiaOpenGLPipeline::draw()`→`FlushAndSubmit()`|
 |8|RenderThread|`eglSwapBuffersWithDamageKHR()`→`queueBuffer()`|
 |9|App进程（BLAST）|`BLASTBufferQueue::acquireNextBufferLocked()`→`Transaction::apply()`|
-|10|SurfaceFlinger|定时器→`MessageQueue::vsyncCallback()`|
+|10|SurfaceFlinger|`scheduleFrame()`预约→`VSyncDispatchTimerQueue`定时器→`vsyncCallback()`|
 |11|SurfaceFlinger|`Scheduler::onFrameSignal()`→`SurfaceFlinger::commit()`|
 |12|SurfaceFlinger+HWC+GPU|`SurfaceFlinger::composite()`→`Output::present()`|
 |13|SurfaceFlinger→App|`onCompositionPresented()`→`releaseBufferCallback()`|
@@ -1335,7 +1335,7 @@ status_t BpSurfaceComposer::setTransactionState(TransactionState&& state, const 
 - `QueuedTransactionState`进入无锁队列：mTransactionHandler.queueTransaction()只做push和`PendingTransactionCount`计数，不会被主线程commit阻塞Binder线程；oneway下客户端连这一步的返回都不等
 - `setTransactionFlags()`
 
-### 9.5 setTransactionFlags()
+### 9.4 setTransactionFlags()
 
 ```cpp
 void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
@@ -1357,21 +1357,10 @@ void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule sche
 
 1. `modulateVsync()`用于调整VSync调度策略，决定SF提前/延后多久醒
 2. Binder线程`fetch_or(mask)`置位，SF主线程`commit()`里 `clearTransactionFlags(mask)` 取走，并据此决定`flushTransactions`。`fetch_or(mask)`的返回值是旧值，`transactionFlags & mask` 为 0 说明之前没排过，才需要真正叫醒 SF；否则说明已经有在途调度，不重复排，新事务会被已经排好的那一帧一起flush掉，同一帧内不管来多少笔事务（多个 App、同一 App多次apply），只有第一笔会触发`resync` + `scheduleCommit`，后面的只置位
-3. 如果没有被排过走`resync() + scheduleCommit()`:`resync()`:由于SF是被外部事务叫醒的，可能已经偏离预测的Vsync时间轴，所以要拿硬件Vsync重新对齐预测器;`scheduleCommit()`:最终落到`mScheduler->scheduleFrame()`
-
-```cpp
-// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp
-const auto workDuration = Duration(mVsync.workDuration.get() - workDurationSlack);
-mVsync.scheduledFrameTimeOpt =
-        mVsync.registration->schedule({.workDuration = workDuration.ns(),
-                                       .readyDuration = 0,
-                                       .lastVsync = mVsync.lastCallbackTime.ns()});
-```
-
-用`VSyncDispatch`按下一个Vsync − workDuration的时间唤醒定时器，到点回调`MessageQueue::vsyncCallback()`唤醒SF工作
+3. 如果没有被排过走`resync() + scheduleCommit()`:`resync()`:由于SF是被外部事务叫醒的，可能已经偏离预测的Vsync时间轴，所以要拿硬件Vsync重新对齐预测器;`scheduleCommit()`最终落到`mScheduler->scheduleFrame()`，在SF自己的`MessageQueue`上arm一次VSync预约。“提前多久、几点醒”是第10步的主题，这里只记住一句：**事务到达SF时，唤醒SF的那个定时器已经被排好了**
 4. 如果被排过了，还是要走`mScheduler->resetAllIdleTimers()`，保证这帧不会被Display显示器的idle状态拖住
 
-### 9.4 BufferTX计数
+### 9.5 BufferTX计数
 
 带buffer的transaction在`SurfaceFlinger::setTransactionState()`（Binder线程）里给`BufferTX`计数+1：
 
@@ -1398,56 +1387,119 @@ void increment(uint32_t layerId) {
 
 name为`const std::string mBlastTransactionName{"BufferTX - " + mName};`，`BufferTX - <layerName>`在Binder线程收到带buffer的transaction时+1，在`Layer::gatherBufferInfo()`latch新buffer时-1，或在`Layer::releasePreviousBuffer()`丢弃旧buffer时-1，反映“已到达SF但未latch的buffer数”。
 
-### 9.5 这一步结束时
+### 9.6 这一步结束时
 
 - buffer所有权已通过`Transaction`交给SurfaceFlinger的待处理事务队列。
 - SF还没应用事务，`Layer::mDrawingState.buffer`未更新。
-- `BufferTX`已+1
+- `BufferTX`已+1。
+- 这次事务已经在`setTransactionFlags()`里置位`mTransactionFlushNeeded`，并在需要时`scheduleCommit()`排好了一次`Vsync-sf`唤醒
 
-## 第10步：vsync-sf触发SurfaceFlinger出帧
+到第9步结束，App这一侧的活已经干完
 
-### 10.1 定时器
+## 第10步：Vsync-sf定时器唤醒SurfaceFlinger
 
-SurfaceFlinger的Vsync由`VSyncDispatchTimerQueue`按预测时间提前`workDuration + readyDuration`安排定时器：
+第9步停在这样一个状态：`apply()`已在App进程返回，带buffer的`Transaction`躺进了SF的待处理事务队列，`BufferTX - <layerName>`+1，而`Layer::mDrawingState.buffer`还是上一帧的buffer。
+
+### 10.1 排唤醒：从scheduleCommit到scheduleFrame
+
+SF侧没有单独的调度器线程：`class Scheduler : public IEventThreadCallback, android::impl::MessageQueue`,`Scheduler`本身就是“消息队列 + VSync预约器”
+
+`setTransactionState()`末尾的`setTransactionFlags()`如果发现这一帧还没排过调度，于是`resync()`把预测器对齐到硬件vsync，再由`scheduleCommit()`落到`mScheduler->scheduleFrame()`。
 
 ```cpp
-// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp:90
+// frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp:2508
+void SurfaceFlinger::scheduleCommit(FrameHint hint, Duration workDurationSlack) {
+    if (hint == FrameHint::kActive) {
+        mScheduler->resetAllIdleTimers();
+    }
+    mPowerAdvisor->notifyDisplayUpdateImminentAndCpuReset();
+    mScheduler->scheduleFrame(workDurationSlack);
+}
+```
+
+`mScheduler->scheduleFrame()`就是`MessageQueue::scheduleFrame()`：
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp:191
+void MessageQueue::scheduleFrame(Duration workDurationSlack) {
+    SFTRACE_CALL();
+    std::lock_guard lock(mVsync.mutex);
+    const auto workDuration = Duration(mVsync.workDuration.get() - workDurationSlack);
+    mVsync.scheduledFrameTimeOpt = mVsync.registration->schedule({.workDuration = workDuration.ns(),
+                                           .readyDuration = 0,
+                                           .lastVsync = mVsync.lastCallbackTime.ns()});
+}
+```
+
+`mVsync.registration`是`VSyncCallbackRegistration`，在`onNewVsyncScheduleLocked()`里创建，绑定的回调是`vsyncCallback`，名字叫`"sf"`
+SF中`VSyncCallbackRegistration`的来历参考[mScheduler->initVsync](../Scheduler相关/Scheduler#initVsync)
+SF中`VSyncCallbackRegistration::schedule`参考[schedule](../VsyncSchedule相关/VsyncSchedule.md#VSyncCallbackRegistration::schedule)
+
+### 10.3 选哪一次vsync、几点醒：VSyncDispatchTimerQueue
+
+`schedule()`最终落到`VSyncDispatchTimerQueueEntry::schedule()`
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
 ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTiming timing,
                                                       VSyncTracker& tracker, nsecs_t now) {
-    auto nextVsyncTime = tracker.nextAnticipatedVSyncTimeFrom(std::max(timing.lastVsync,
+    SFTRACE_NAME("VSyncDispatchTimerQueueEntry::schedule");
+    // 预测下一个Vsync  不能早于上次VSync 也不早于workDuration和readyDuration后
+    auto nextVsyncTime =
+            tracker.nextAnticipatedVSyncTimeFrom(std::max(timing.lastVsync,
                                                           now + timing.workDuration +
                                                                   timing.readyDuration),
                                                  timing.committedVsyncOpt.value_or(
                                                          timing.lastVsync));
+    // 定时器必须在VSync之前workDuration + readyDuration就醒来，留足准备时间
     auto nextWakeupTime = nextVsyncTime - timing.workDuration - timing.readyDuration;
+    // 新算出的VSync比上次的目标VSync晚了超过一个周期，代表新Vsync超过太多，可能跳过实际需要的Vsync
+    bool const wouldSkipAVsyncTarget =
+            mArmedInfo && (nextVsyncTime > (mArmedInfo->mActualVsyncTime + mMinVsyncDistance));
+    // 新的唤醒时间比上次的唤醒时间晚了超过一个周期，将会跳过需要的唤醒
+    bool const wouldSkipAWakeup =
+            mArmedInfo && ((nextWakeupTime > (mArmedInfo->mActualWakeupTime + mMinVsyncDistance)));
+    SFTRACE_FORMAT_INSTANT("%s: wouldSkipAVsyncTarget=%d wouldSkipAWakeup=%d", mName.c_str(),
+                           wouldSkipAVsyncTarget, wouldSkipAWakeup);
+    // 如果跳过tracker给出的预测Vsync和WakeupTime，对齐到mArmedInfo->mActualVsyncTime
+    if (wouldSkipAVsyncTarget || wouldSkipAWakeup) {
+        nextVsyncTime = mArmedInfo->mActualVsyncTime;
+    // 不需要跳过就微调
+    } else {
+        nextVsyncTime = adjustVsyncIfNeeded(tracker, nextVsyncTime);
+    }
+    // 最终唤醒时间不能早于now
+    nextWakeupTime = std::max(now, nextVsyncTime - timing.workDuration - timing.readyDuration);
+    // 更新本VSyncDispatchTimerQueueEntry的ScheduleTiming和ArmedInfo信息
+    auto const nextReadyTime = nextVsyncTime - timing.readyDuration;
+    mScheduleTiming = timing;
+    mArmedInfo = {nextWakeupTime, nextVsyncTime, nextReadyTime};
+    return ScheduleResult{TimePoint::fromNs(nextWakeupTime), TimePoint::fromNs(nextVsyncTime)};
 }
 ```
 
-到点后`timerCallback()`（334）收集到期条目，在锁外逐个调用（376）：
+- `nextAnticipatedVSyncTimeFrom(max(lastVsync, now + workDuration + readyDuration))`取的是从现在起还留得出工作时间的最早那次vsync
+- `nextWakeupTime = nextVsyncTime - workDuration - readyDuration`。SF的`readyDuration`是0，所以SF在目标vsync前`workDuration`醒来；对于APP来说，`workDuration`是自己的工作时间，`readyDuration`通常是SF的`workDuration`，这个结论在`Scheduler`中创建APP的`EventThread`的时候可以得出
+- `adjustVsyncIfNeeded()`防止同一帧被响应两次：如果这次vsync已经派发过，或者新目标离上次派发不足一个周期，就顺延到下一次。
+
+vsync时间本身来自`VsyncTracker`的预测：它吃硬件vsync采样`addResyncSample()`来校准，也吃第13步的present fence的`Scheduler::addPresentFence()`。预测准不准，取决于上一帧真实上屏的时刻。
+
+到点后`timerCallback()`在锁内把到期entry收进`invocations`，再在锁外逐个回调：
 
 ```cpp
-// VSyncDispatchTimerQueue.cpp:376
-invocation.callback->callback(invocation.vsyncTimestamp, invocation.wakeupTimestamp,
-                              invocation.deadlineTimestamp);
+// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
+for (auto const& invocation : invocations) {
+    ftl::Concat trace(ftl::truncated<5>(invocation.callback->name()));
+    SFTRACE_FORMAT("%s: %s", __func__, trace.c_str());
+    invocation.callback->callback(invocation.vsyncTimestamp, invocation.wakeupTimestamp,
+                                  invocation.deadlineTimestamp);
+}
 ```
 
-`MessageQueue`在`onNewVsyncScheduleLocked()`里注册`vsyncCallback`（`MessageQueue.cpp:111`）：
+### 10.4 到点：vsyncCallback
 
 ```cpp
-// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp:117
-mVsync.registration = std::make_unique<
-        scheduler::VSyncCallbackRegistration>(std::move(dispatch),
-                                              std::bind(&MessageQueue::vsyncCallback, this,
-                                                        std::placeholders::_1,
-                                                        std::placeholders::_2,
-                                                        std::placeholders::_3),
-                                              "sf");
-```
-
-### 10.2 vsyncCallback
-
-```cpp
-// MessageQueue.cpp:59
+// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp:59
 void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, nsecs_t readyTime) {
     SFTRACE_CALL();
     mVsync.value = (mVsync.value + 1) % 2;   // VSYNC-sf翻转
@@ -1455,6 +1507,7 @@ void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, ns
     {
         std::lock_guard lock(mVsync.mutex);
         mVsync.lastCallbackTime = expectedVsyncTime;
+        mVsync.scheduledFrameTimeOpt.reset();
     }
     const auto vsyncId = VsyncId{mVsync.tokenManager->generateTokenForPredictions(
             {targetWakeupTime, readyTime, vsyncTime})};
@@ -1462,14 +1515,17 @@ void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, ns
 }
 ```
 
-三件事：`mVsync.value`取反（systrace里`VSYNC-sf`翻转）；生成`VsyncId`（`TokenManager`把`targetWakeupTime`、`readyTime`、`vsyncTime`编码成token，沿FrameTimeline传给App，用于把App一帧、SF一帧、HWC一次present对应起来）；`dispatchFrame()`把消息投给SF主线程。
+`vsyncCallback`跑在`VSyncDispatchTimerQueue`的定时器线程上，不是SF主线程；它只做四件事：
 
-`vsyncCallback`运行在VsyncDispatchTimerQueue的定时器线程，不是SF主线程；commit/composite在主线程执行。
+1. `mVsync.value`取反，Perfetto里`VSYNC-sf`翻转。
+2. 记下`lastCallbackTime`，并`mVsync.scheduledFrameTimeOpt.reset()`——这次预约已兑现，`getScheduledFrameResult()`从此返回空。
+3. 生成`VsyncId`：`TokenManager`把`targetWakeupTime`、`readyTime`、`vsyncTime`一起编码成一个token。同一帧在App侧和SF侧各有一个VsyncId，都由这个`TokenManager`生成、只是取各自的预测，FrameTimeline用它们把surface frame和display frame对上。
+4. `dispatchFrame()`把帧消息投给SF主线程。commit和composite都在主线程做，定时器线程到这里就交棒了。
 
-### 10.3 dispatchFrame到onFrameSignal
+### 10.5 主线程醒来：dispatchFrame到onFrameSignal
 
 ```cpp
-// MessageQueue.cpp:32
+// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp:32
 void MessageQueue::Handler::dispatchFrame(VsyncId vsyncId, TimePoint expectedVsyncTime) {
     if (!mFramePending.exchange(true)) {
         mVsyncId = vsyncId;
@@ -1478,18 +1534,26 @@ void MessageQueue::Handler::dispatchFrame(VsyncId vsyncId, TimePoint expectedVsy
     }
 }
 
-// MessageQueue.cpp:44
+// frameworks/native/services/surfaceflinger/Scheduler/MessageQueue.cpp:44
 void MessageQueue::Handler::handleMessage(const Message&) {
     mFramePending.store(false);
     mQueue.onFrameSignal(mQueue.mCompositor, mVsyncId, mExpectedVsyncTime);
 }
 ```
 
-`mFramePending`保证帧消息不堆叠。主线程从`waitMessage()`返回后进入`onFrameSignal()`。这一步与App侧第2步对称：App侧是`VSYNC-app`写异步消息，SF侧是`VSYNC-sf`写帧消息；两者时钟源相同，但`workDuration`不同，App覆盖主线程`doFrame`，SF覆盖commit+composite。
+`mFramePending`保证帧消息不堆叠：主线程还没处理完上一帧时，新到的帧信号被直接丢弃，也不会覆盖已经存好的`mVsyncId`——队列里那条消息仍是最早那次vsync的。代价是这一帧的合成顺延到下一次唤醒，好处是SF不会为错过的vsync补跑、堆积。
+
+`handleMessage()`由`mLooper`在SF主线程上调用，就是`Scheduler::run()`里`waitMessage()`的`pollOnce(-1)`返回处。`onFrameSignal()`在`MessageQueue`里是纯虚函数（`MessageQueue.h:115`），由`Scheduler`实现（`Scheduler.h:396`）。
+
+到这里，SF主线程手上只有三样东西：`vsyncId`、`expectedVsyncTime`，以及“这一帧要干活”的隐含信号。它进入`Scheduler::onFrameSignal()`（`Scheduler.cpp:411`）——第11步正是从那里开始：`beginFrame()`把`expectedVsyncTime`换算成本帧的`expectedPresentTime`，然后`commit()`去latch第9步送来的那块buffer。
+
+和App侧第2步对照：那边是`VSYNC-app`翻转后进`Choreographer.doFrame()`，这边是`VSYNC-sf`翻转后进`onFrameSignal()`；两边共享同一个`VsyncTracker`，唤醒点分别由`appWorkDuration`和`sfWorkDuration`决定，一个覆盖UI线程的录制，一个覆盖commit+composite。
 
 ## 第11步：commit与latch
 
 ### 11.1 Scheduler::onFrameSignal
+
+第10步最后一行的`onFrameSignal()`就是这里。它先把这个`vsync-sf`翻译成本帧的时间参数，再调用`commit()`：
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp:411

@@ -386,6 +386,7 @@ VSyncCallbackRegistration::VSyncCallbackRegistration(VSyncCallbackRegistration&&
       : mDispatch(std::move(other.mDispatch)), mToken(std::exchange(other.mToken, std::nullopt)) {}
 
 
+<a id="VSyncCallbackRegistration::schedule"></a>
 // 内部的三个方法都是用自己绑定的mToken（由一个VsyncDispatchTimerQueueEntry生成）传递给VsyncDispatch
 std::optional<ScheduleResult> VSyncCallbackRegistration::schedule(
         VSyncDispatch::ScheduleTiming scheduleTiming) {
@@ -643,6 +644,8 @@ auto VSyncDispatchTimerQueueEntry::getArmedInfo(VSyncTracker& tracker, nsecs_t n
     return ArmingInfo{nextWakeupTime, nextVsyncTime, nextReadyTime};
 }
 ```
+
+<a id="VSyncDispatchTimerQueueEntry::schedule"> </a>
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
