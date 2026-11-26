@@ -1,6 +1,6 @@
-﻿# 出帧流程
+# 出帧流程
 
-本文按13个步骤展开一帧从App主线程到屏幕上屏的完整路径。类名、方法名、行号取自`android-17.0.0_r1`（<https://cs.android.com/android/platform/superproject/+/android-17.0.0_r1>），抓取时间2026-11，行号会随提交变化，引用时以方法名为准。
+本文按13个步骤展开一帧从App主线程到屏幕上屏的完整路径。类名、方法名、行号取自`android-17.0.0_r1`（<https://cs.android.com/android/platform/superproject/+/android-17.0.0_r1>），并以本地源码`/home/jxx/android/aosp`（frameworks/base 的 git tag 为`android-17.0.0_r1`）逐节核对；代码块按源码删节，省略处用`...`标出。行号会随提交变化，引用时以方法名为准。
 
 ## 总览
 
@@ -11,7 +11,7 @@
 |3|App主线程|`ViewRootImpl.performTraversals()`→`performDraw()`|
 |4|App主线程→RenderThread|`HardwareRenderer.syncAndDrawFrame()`→`DrawFrameTask::drawFrame()`|
 |5|RenderThread|`DrawFrameTask::run()`→`syncFrameState()`|
-|6|RenderThread|`SkiaOpenGLPipeline::getFrame()`→`eglBeginFrame`→`dequeueBuffer`|
+|6|RenderThread|`SkiaOpenGLPipeline::getFrame()`→`eglBeginFrame`→`Surface::dequeueBuffer()`|
 |7|RenderThread+GPU|`SkiaOpenGLPipeline::draw()`→`FlushAndSubmit()`|
 |8|RenderThread|`eglSwapBuffersWithDamageKHR()`→`queueBuffer()`|
 |9|App进程（BLAST）|`BLASTBufferQueue::acquireNextBufferLocked()`→`Transaction::apply()`|
@@ -20,7 +20,7 @@
 |12|SurfaceFlinger+HWC+GPU|`SurfaceFlinger::composite()`→`Output::present()`|
 |13|SurfaceFlinger→App|`onCompositionPresented()`→`releaseBufferCallback()`|
 
-时间轴上：App在`vsync-app`之前完成调度，`vsync-app`到来后`doFrame`；SurfaceFlinger在`vsync-app`之后、`vsync-sf`之前拿到App提交的buffer，在`vsync-sf`回调中commit并composite；HWC在下一个刷新周期扫描上屏，present fence此时signal。
+时间轴上：App在`vsync-app`之前完成调度，`vsync-app`到来后`doFrame`；SurfaceFlinger在`vsync-app`之后、`vsync-sf`之前拿到App提交的buffer，在`vsync-sf`回调中commit并composite；HWC在下一个刷新周期扫描上屏，present fence此时signal。更精确地说，App和SF的定时器瞄准的是同一次display vsync，只是唤醒点不同：App提前`appWorkDuration + sfWorkDuration`醒，SF提前`sfWorkDuration`醒，详见10.2。
 
 ## 第1步：窗口调度下一帧
 
@@ -30,14 +30,14 @@
 
 进入调度的入口有多个，最终都落到`ViewRootImpl.scheduleTraversals()`：
 
-- `invalidate()`：内容失效。`View.invalidate()`沿父链调用`ViewGroup.invalidateChild()`，到达`ViewRootImpl.invalidateChildInParent()`，最终进入`invalidateRectOnScreen()`。
+- `invalidate()`：内容失效。硬件加速时`View.invalidate()`经父链调`ViewGroup.invalidateChild()`，后者直接走 HW 快路径`onDescendantInvalidated()`，一路向上到`ViewRootImpl.onDescendantInvalidated()`，再调`invalidate()`把整窗`mDirty`标脏并调度；只有软件渲染才继续沿`invalidateChildInParent()`走到`invalidateRectOnScreen()`合并脏矩形。
 - `requestLayout()`：测量或位置可能失效。`View.requestLayout()`沿父链传播到`ViewRootImpl.requestLayout()`。
 - 输入事件：`scheduleConsumeBatchedInput()`把输入消费挂到`CALLBACK_INPUT`，消费后若状态变化再由View自己调`invalidate()`或`requestLayout()`。
-- 动画：属性动画在`CALLBACK_ANIMATION`阶段改属性，改完调用`invalidate()`。
+- 动画：属性动画在`CALLBACK_ANIMATION`阶段改属性，改完调`invalidateViewProperty()`；硬件加速且已有DisplayList时它直接`damageInParent()`→`onDescendantInvalidated()`，不再逐级算脏矩形。
 - Insets动画：`CALLBACK_INSETS_ANIMATION`阶段更新Insets，随后触发traversal。
 - 窗口变化：`relayoutWindow()`返回新尺寸或Surface，`performTraversals()`内部置位`mFullRedrawNeeded`。
 
-`invalidateChildInParent()`并不遍历View树，它只把脏区域合并进`mDirty`后调`scheduleTraversals()`
+软件渲染路径下，`invalidateChildInParent()`并不遍历View树，它只把脏矩形合并进`mDirty`后调`scheduleTraversals()`；硬件加速路径连矩形合并都不做，`invalidate()`直接把整窗置脏，精确damage留给RenderThread的`DamageAccumulator`去算（第5、7步）。所以“界面只脏了一小块”在Java侧并不会缩小`mDirty`，真正的脏区优化发生在HWUI。
 
 ```java
 // frameworks/base/core/java/android/view/ViewRootImpl.java
@@ -103,9 +103,9 @@ void scheduleTraversals() {
 四个动作：
 
 1. `mTraversalScheduled`标记本帧已调度。同一帧内VRI多次`invalidate()`/`requestLayout()`只有第一个去请求Vsync。
-2. `postTraversalBarrier()`插入同步屏障，只拦同步消息，不拦异步消息。Vsync消息在`onVsync()`里`setAsynchronous(true)`，能越过屏障；屏障保证队列里已有的同步消息不会插到traversal前面。
+2. `postTraversalBarrier()`插入同步屏障，只拦同步消息，不拦异步消息。Vsync消息在`onVsync()`里`setAsynchronous(true)`，能越过屏障；屏障拦的是`scheduleTraversals()`之后post的同步消息，保证它们不会抢在traversal之前执行。`scheduleTraversals()`之前已入队的同步消息不受屏障影响（执行顺序仍由dueTime决定）——ViewRootImpl这段代码上方的注释专门解释了`setText()`后立刻`post()`的Runnable为什么仍能看到新测量结果。
 3. `postVsyncCallback(CALLBACK_TRAVERSAL, mTraversalCallback)`把`mTraversalCallback`对象挂进Choreographer对应的callback队列。
-4. `notifyRendererOfFramePending()`通知RenderThread即将出帧；`pokeDrawLockIfNeeded()`在息屏/Doze场景短暂持有绘制锁。
+4. `notifyRendererOfFramePending()`通知RenderThread即将出帧；`pokeDrawLockIfNeeded()`在Doze场景短暂持有绘制锁。后者条件很窄：仅当`!mDisableDrawWakeLock && mAttachInfo.mDisplayState == STATE_DOZE`，且窗口是有焦点的Activity窗口时才poke；`mDisableDrawWakeLock`由兼容性开关`DISABLE_DRAW_WAKE_LOCK`与`android.view.flags.disable_draw_wake_lock`决定，A17上该flag固定为ENABLED，所以这条路径默认不生效。
 
 ### 1.3 doTraversal
 
@@ -133,6 +133,8 @@ void doTraversal(long frameTimeNanos) {
 ```
 
 先清标记、移除屏障，与`scheduleTraversals()`中一一对应，再遍历。清标记和移除同步屏障在`performTraversals()`之前：`performTraversals()`过程中View可能再次`invalidate()`，此时`mTraversalScheduled`已为false，新调度会再插同步屏障并post一次callback，从而申请下一帧。
+
+Choreographer侧还有第二道同样的标记：`doFrame()`在进入各阶段回调之前就把`mFrameScheduled`置为false并更新`mLastFrameTimeNanos`，然后才`doCallbacks()`。所以traversal里再次`scheduleTraversals()`能一路走到`scheduleFrameLocked()`申请下一次`vsync-app`。这两层标记都必须在本帧回调前清掉，缺一层都会让“帧中再次请求下一帧”失效。
 
 ## 第2步：Vsync到达与doFrame
 
@@ -198,7 +200,7 @@ private void scheduleFrameLocked(long now) {
 
 ### 2.2 EventThread投递Vsync
 
-SurfaceFlinger进程根据不同Android版本有不同的EventThread，最新的A17中，只保留了服务App的`VSYNC-app`。Vsync由`VsyncDispatchTimerQueue`按时回调`EventThread`的`onVsync`，EventThread的`onVsync()`把Vsync事件塞进`mPendingEvents`并唤醒自己去`dispatchEvent()`：
+SurfaceFlinger进程在不同版本里EventThread的数量不同。A17的`Scheduler`只创建一条名为`app`的EventThread，服务App的`VSYNC-app`；SF自己的`VSYNC-sf`不走EventThread，而是`MessageQueue`直接注册的定时器回调（第10步）。App侧的Vsync由`VsyncDispatchTimerQueue`按时回调`EventThread::onVsync()`，它把事件塞进`mPendingEvents`并唤醒EventThread线程去`dispatchEvent()`：
 
 ```cpp
 // frameworks/native/services/surfaceflinger/Scheduler/EventThread.cpp
@@ -231,6 +233,12 @@ private final class FrameDisplayEventReceiver extends DisplayEventReceiver
         if (timestampNanos > now) {
             timestampNanos = now;
         }
+        // 调试保护：正常情况下一次只应有一个在途vsync
+        if (mHavePendingVsync) {
+            Log.w(TAG, "Already have a pending vsync event.  There should only be one at a time.");
+        } else {
+            mHavePendingVsync = true;
+        }
         mTimestampNanos = timestampNanos;
         mFrame = frame;
         mLastVsyncEventData.copyFrom(vsyncEventData);
@@ -242,6 +250,7 @@ private final class FrameDisplayEventReceiver extends DisplayEventReceiver
 
     @Override
     public void run() {
+        mHavePendingVsync = false;
         doFrame(mTimestampNanos, mFrame, mLastVsyncEventData);
     }
 }
@@ -329,11 +338,14 @@ public void run(long frameTimeNanos) {
 - `TRAVERSAL`读取前面所有阶段的结果，执行measure、layout、draw。
 - `COMMIT`在traversal之后，用于提交本帧事务回调。
 
-`doFrame()`开始回调前还有几件处理：
+`doFrame()`开始回调前还有几件处理，顺序不能颠倒：
 
-1. jitter对齐。若`System.nanoTime() - frameTimeNanos`超过一个帧间隔，说明主线程错过Vsync太久，Choreographer把`frameTimeNanos`对齐到当前时间并减去`jitterNanos % frameIntervalNanos`，跳帧过多时打印`Skipped N frames!`。
-2. 帧时间倒退检查。若`frameTimeNanos < mLastFrameTimeNanos`，`scheduleVsyncLocked()`后返回。
-3. buffer stuffing恢复。`updateBufferStuffingState()`可能返回`DELAY_FRAME`，主动推迟一帧以降低排队buffer数；返回`OFFSET`时会把动画时间轴整体减一个帧间隔。
+1. buffer stuffing恢复判定。`updateBufferStuffingState()`最先执行，返回`DELAY_FRAME`时直接`return`，本帧不发任何回调，只`scheduleVsyncLocked()`等下一次Vsync；返回`OFFSET`时只把`offsetFrameTimeNanos`减一个帧间隔，供FrameTimeline使用。
+2. jitter对齐。若`System.nanoTime() - frameTimeNanos`超过一个帧间隔，说明主线程错过Vsync太久，Choreographer把`frameTimeNanos`对齐到当前时间并减去`jitterNanos % frameIntervalNanos`，跳帧过多时打印`Skipped N frames!`。jitter用的是**未**被buffer stuffing调整过的`frameTimeNanos`。
+3. 帧时间倒退检查。若`frameTimeNanos < mLastFrameTimeNanos`，`scheduleVsyncLocked()`后返回。
+4. FPSDivisor检查。`mFPSDivisor > 1`时若距上一帧不足`frameIntervalNanos * mFPSDivisor`，同样跳过本帧。
+
+`updateBufferStuffingState()`的触发源在别处：第6步`dequeueBuffer()`阻塞在buffer释放上超过半帧时，BBQ会回调`Choreographer.onWaitForBufferRelease()`，把`mBufferStuffingState.isStuffed`置位；下一次`doFrame()`看到这一位就返回`DELAY_FRAME`，从而把App主动推迟一帧、少排一个buffer。`OFFSET`则用于恢复期内把动画时间轴回拨，避免动画在恢复后突然跳进。
 
 ## 第3步：performTraversals与DisplayList录制
 
@@ -343,20 +355,28 @@ public void run(long frameTimeNanos) {
 
 `performTraversals()`不是每次都完整执行measure、layout、draw：
 
-- `performMeasure()`：窗口尺寸、配置变化、`mLayoutRequested`、Insets变化时执行。根View的MeasureSpec由窗口尺寸和`WindowManager.LayoutParams`算出。
-- `performLayout()`：测量完成、`layoutRequested`为true、窗口位置变化时执行。
-- `performDraw()`：窗口可见、Surface有效、确实有脏区域时执行；`mFullRedrawNeeded`为true时整窗重绘。
+- `performMeasure()`：`layoutRequested = mLayoutRequested && (!mStopped || mReportNextDraw)`为真时，先走`measureHierarchy()`按期望窗口尺寸测量；窗口尺寸/Insets/配置有变化（`mWidth != host.getMeasuredWidth()`等）时再补一次`performMeasure()`；`mViewMeasureDeferred`为true时用`frame`尺寸补测。根View的MeasureSpec由窗口尺寸和`WindowManager.LayoutParams`算出。
+- `performLayout()`：`didLayout = layoutRequested && (!mStopped || mReportNextDraw)`，只有它为真才`performLayout(lp, mWidth, mHeight)`。窗口只是移动时走`maybeHandleWindowMove()`改偏移，不触发layout。
+- `performDraw()`：先排除屏幕灭（且不要求报告下一帧）和根View为空两种情况；是否真正绘制由`draw()`里的`!dirty.isEmpty() || mIsAnimating || accessibilityFocusDirty`决定；`mFullRedrawNeeded`为true时整窗重绘。硬件加速下进入`draw()`后`dirty`会被`setEmpty()`，矩形脏区到此为止。
 
 ```java
 // frameworks/base/core/java/android/view/ViewRootImpl.java
+boolean layoutRequested = mLayoutRequested && (!mStopped || mReportNextDraw);
+if (layoutRequested) {
+    windowSizeMayChange |= measureHierarchy(host, lp, mView.getContext().getResources(),
+            desiredWindowWidth, desiredWindowHeight, shouldOptimizeMeasure);
+}
+...
 if (mViewMeasureDeferred) {
     performMeasure(MeasureSpec.makeMeasureSpec(frame.width(), MeasureSpec.EXACTLY),
                    MeasureSpec.makeMeasureSpec(frame.height(), MeasureSpec.EXACTLY));
 }
-// frameworks/base/core/java/android/view/ViewRootImpl.java
-performLayout(lp, mWidth, mHeight);
-// frameworks/base/core/java/android/view/ViewRootImpl.java
-if (!performDraw(mActiveSurfaceSyncGroup)) { ... }
+...
+final boolean didLayout = layoutRequested && (!mStopped || mReportNextDraw);
+if (didLayout) {
+    performLayout(lp, mWidth, mHeight);
+    ...
+}
 ```
 
 `performMeasure()`调根View的`measure()`，`performLayout()`调根View的`layout()`，二者内部递归整棵树。`performDraw()`则按是否硬件加速走两条完全不同的路径。
@@ -368,6 +388,19 @@ if (!performDraw(mActiveSurfaceSyncGroup)) { ... }
 ```java
 private boolean performDraw(@Nullable SurfaceSyncGroup surfaceSyncGroup) {
     ...
+    // 屏幕灭且不是“下一次绘制必须报告”时直接返回
+    if (mAttachInfo.mDisplayState == Display.STATE_OFF && !mReportNextDraw) {
+        mLastPerformDrawSkippedReason = "screen_off";
+        return false;
+    } else if (mView == null) {
+        mLastPerformDrawSkippedReason = "no_root_view";
+        return false;
+    }
+
+    // 有sync group时强制整窗重绘
+    final boolean fullRedrawNeeded = mFullRedrawNeeded || surfaceSyncGroup != null;
+    mFullRedrawNeeded = false;
+    mIsDrawing = true;
     Trace.traceBegin(Trace.TRACE_TAG_VIEW, mDrawTrace);
     addFrameCommitCallbackIfNeeded();
     boolean usingAsyncReport;
@@ -393,11 +426,14 @@ private boolean draw(boolean fullRedrawNeeded, @Nullable SurfaceSyncGroup active
     ...
     if (isHardwareEnabled()) {
         ...
+        // Java侧矩形脏区到此为止，HWUI在RenderThread上算damage
+        dirty.setEmpty();
+        ...
         mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
         ...
     } else {
         if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
-                scalingRequired, dirty)) {
+                scalingRequired, dirty, surfaceInsets)) {
             return false;
         }
     }
@@ -425,11 +461,30 @@ void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
 
 ```java
 // frameworks/base/core/java/android/view/ThreadedRenderer.java
-// 录制根View的DisplayList
+// 录制根View的DisplayList（节选）
 private void updateRootDisplayList(View view, DrawCallbacks callbacks) {
     Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Record View#draw()");
     updateViewTreeDisplayList(view);
     ...
+    // 只有根节点自己需要重录时才开录；否则复用旧的根DisplayList
+    if (mRootNodeNeedsUpdate || !mRootNode.hasDisplayList()) {
+        RecordingCanvas canvas = mRootNode.beginRecording(mSurfaceWidth, mSurfaceHeight);
+        try {
+            final int saveCount = canvas.save();
+            canvas.translate(mInsetLeft, mInsetTop);
+            callbacks.onPreDraw(canvas);
+
+            canvas.enableZ();
+            canvas.drawRenderNode(view.updateDisplayListIfDirty());
+            canvas.disableZ();
+
+            callbacks.onPostDraw(canvas);
+            canvas.restoreToCount(saveCount);
+            mRootNodeNeedsUpdate = false;
+        } finally {
+            mRootNode.endRecording();
+        }
+    }
     Trace.traceEnd(Trace.TRACE_TAG_VIEW);
 }
 
@@ -443,7 +498,9 @@ private void updateViewTreeDisplayList(View view) {
 }
 ```
 
-`View.updateDisplayListIfDirty()`：
+根RenderNode的DisplayList里核心只有一条`drawRenderNode(view的RenderNode)`（`onPreDraw()`/`onPostDraw()`还可能前后加少量指令，例如窗口背景、模糊等），这就是“整棵树靠引用串起来”的直接证据。
+
+`View.updateDisplayListIfDirty()`（节选）：
 
 ```java
 // frameworks/base/core/java/android/view/View.java
@@ -464,17 +521,24 @@ public RenderNode updateDisplayListIfDirty() {
             return renderNode; // no work needed
         }
         mRecreateDisplayList = true;
+        int width = mRight - mLeft;
+        int height = mBottom - mTop;
+        int layerType = getLayerType();
         renderNode.clearStretch();
         final RecordingCanvas canvas = renderNode.beginRecording(width, height);
         try {
-            if (getLayerType() == LAYER_TYPE_SOFTWARE) {
+            if (layerType == LAYER_TYPE_SOFTWARE) {
                 ...
             } else {
                 computeScroll();
                 canvas.translate(-mScrollX, -mScrollY);
+                mPrivateFlags |= PFLAG_DRAWN | PFLAG_DRAWING_CACHE_VALID;
+                mPrivateFlags &= ~PFLAG_DIRTY_MASK;
+                mPrivateFlags4 |= PFLAG4_HAS_DRAWN;
                 if ((mPrivateFlags & PFLAG_SKIP_DRAW) == PFLAG_SKIP_DRAW) {
                     // 这里递归绘制子View
                     dispatchDraw(canvas);
+                    ...
                 } else {
                     draw(canvas);
                 }
@@ -483,6 +547,8 @@ public RenderNode updateDisplayListIfDirty() {
             renderNode.endRecording();
             setDisplayListProperties(renderNode);
         }
+    } else {
+        ...
     }
     return renderNode;
 }
@@ -505,7 +571,9 @@ boolean draw(@NonNull Canvas canvas, ViewGroup parent, long drawingTime) {
 }
 ```
 
-RenderNode树引用的实际收益是“只重录脏子树”：后代`invalidate()`时只清祖先的`PFLAG_DRAWING_CACHE_VALID`、不置`PFLAG_INVALIDATED`，根节点`updateDisplayListIfDirty()`只走`dispatchGetDisplayList()`往下刷脏节点，父的DisplayList不重录；因为每个View的RenderNode身份不变，旧引用继续指向该子节点最新的DisplayList。所以根RenderNode的DisplayList里是子RenderNode的引用，整棵树没有被压成扁平指令流。
+RenderNode树引用的实际收益是“只重录脏子树”：硬件加速下后代`invalidate()`沿`onDescendantInvalidated()`上行，只清祖先的`PFLAG_DRAWING_CACHE_VALID`、不置`PFLAG_INVALIDATED`，根节点`updateDisplayListIfDirty()`只走`dispatchGetDisplayList()`往下刷脏节点，父的DisplayList不重录；因为每个View的RenderNode身份不变，旧引用继续指向该子节点最新的DisplayList。所以根RenderNode的DisplayList里是子RenderNode的引用，整棵树没有被压成扁平指令流。
+
+例外是软件层：`onDescendantInvalidated()`遇到`mLayerType == LAYER_TYPE_SOFTWARE`的父容器时，会把该父容器置上`PFLAG_INVALIDATED | PFLAG_DIRTY`并把target升级为它自己，这时它必须重录整层（软件层是一张Bitmap，没有子DisplayList可复用）。
 
 ### 3.4 本步结束时的状态
 
@@ -529,15 +597,20 @@ public int syncAndDrawFrame(@NonNull FrameInfo frameInfo) {
 }
 ```
 
-`mNativeProxy`是`private final long`，在构造函数里由`nCreateProxy(!mOpaque, mRootNode.mNativeRenderNode)`赋值；JNI侧`android_view_ThreadedRenderer_createProxy()`执行`new RenderProxy(...)`后把指针按`jlong`返回
+`mNativeProxy`是`private final long`，在构造函数里由`nCreateProxy(!mOpaque, mRootNode.mNativeRenderNode, useIpcCanvas)`赋值；第三参`useIpcCanvas`决定这条渲染通道是否走IPC Canvas（`SkiaIpcPipeline`）。JNI侧`android_view_ThreadedRenderer_createProxy()`执行`new RenderProxy(...)`后把指针按`jlong`返回。
 
-native方法声明与注册项（`android_graphics_HardwareRenderer.cpp`）：
+native方法在Java侧声明（`frameworks/base/graphics/java/android/graphics/HardwareRenderer.java`）：
 
 ```java
+private static native long nCreateProxy(boolean translucent, long rootRenderNode,
+        boolean useIpcCanvas);
 private static native int nSyncAndDrawFrame(long nativeProxy, long[] frameInfo, int size);
 ```
 
+注册项在JNI文件（`frameworks/base/libs/hwui/jni/android_graphics_HardwareRenderer.cpp`）：
+
 ```cpp
+{"nCreateProxy", "(ZJZ)J", (void*)android_view_ThreadedRenderer_createProxy},
 {"nSyncAndDrawFrame", "(J[JI)I", (void*)android_view_ThreadedRenderer_syncAndDrawFrame},
 ```
 
@@ -582,7 +655,7 @@ void DrawFrameTask::postAndWait() {
 }
 ```
 
-`postAndWait()`把`DrawFrameTask::run`投递到RenderThread队列，然后在条件变量上等待。这个等待不是等整帧画完：`run()`在`syncFrameState()`完成并确认可绘制后调用`unblockUiThread()`，提前放行UI线程；能否提前放行取决于`syncFrameState()`返回的`info.prepareTextures`，纹理都准备好才允许。
+`postAndWait()`把`DrawFrameTask::run`投递到RenderThread队列，然后在条件变量上等待。这个等待不是等整帧画完：`run()`在`syncFrameState()`返回后调用`unblockUiThread()`提前放行UI线程。是否提前放行只看`syncFrameState()`的返回值`info.prepareTextures`（纹理缓存是否备齐），与`canDrawThisFrame`无关——即使本帧注定被丢，只要纹理备齐也照样先放行。
 
 `drawFrame()`返回的`mSyncResult`是位掩码，含`FrameDropped`、`UIRedrawRequired`、`LostSurfaceRewardIfFound`、`ContextIsStopped`等标志，`ThreadedRenderer.draw()`据此决定是否`invalidate()`或强制relayout。
 
@@ -590,7 +663,7 @@ void DrawFrameTask::postAndWait() {
 
 - 边界前：DisplayList写入、RenderNode属性修改都在UI线程完成。
 - 边界处：UI线程`postAndWait()`，RenderThread开始`run()`。
-- 同步点：`syncFrameState()`完成，RenderThread确认树可绘制，`unblockUiThread()`唤醒UI线程。
+- 同步点：`syncFrameState()`返回，RenderThread已接走树状态快照和DisplayList引用，`unblockUiThread()`唤醒UI线程；纹理未备齐时这次同步会推迟到`draw()`之后。
 - 同步点后：UI线程可以修改View树，RenderThread继续`context->draw()`。
 
 所以UI线程与RenderThread的同步边界是等到树状态已被RenderThread接走。
@@ -627,6 +700,7 @@ void DrawFrameTask::run() {
         unblockUiThread();
     }
     ...
+    // 省略：把frameCallback/frameCompleteCallback搬到局部变量、enqueueFrameWork()
     if (CC_LIKELY(canDrawThisFrame)) {
         // 走到第6步的Draw()
         context->draw(solelyTextureViewUpdates);
@@ -636,6 +710,8 @@ void DrawFrameTask::run() {
         }
         context->waitOnFences();
     }
+    ...
+    // 省略：frameCompleteCallback、hardware buffer的pipeline->flush()
     if (!canUnblockUiThread) {
         unblockUiThread();
     }
@@ -722,15 +798,17 @@ void RenderNode::prepareTree(TreeInfo& info) {
 }
 ```
 
-`prepareTree()`逐个`node->prepareTree(info)`，把DisplayList属性同步到RenderThread可见状态：变换矩阵、裁剪、alpha、动画属性、DisplayList版本。动画属性在`mAnimationContext->runRemainingAnimations()`里推进。
+`prepareTree()`逐个`node->prepareTree(info)`，把DisplayList属性同步到RenderThread可见状态：变换矩阵、裁剪、alpha、DisplayList版本。每个节点的动画在`RenderNode::prepareTreeImpl()`里由`mAnimatorManager.animate(info)`推进（`info.runAnimations`为真时）；遍历结束后`mAnimationContext->runRemainingAnimations(info)`只处理“遍历时没轮到”的剩余动画节点，随后`freePrefetchedLayers()`、`mIsDirty = true`。
 
-`MODE_FULL`用于窗口主RenderNode，完整同步；`MODE_RT_ONLY`用于其他node，只同步RenderThread需要的最小状态
+`MODE_FULL`用于窗口主RenderNode，完整同步；`MODE_RT_ONLY`用于其他node，只同步RenderThread需要的最小状态。
+
+`prepareTree()`末尾还有几道决定“本帧画不画”的门：`hasOutputTarget()`为false（NoOutputTarget）、同一Vsync已经画过（AlreadyDrawn）、`mRenderNodes[1]`不可绘制（NothingToDraw）、`reserveNext()`失败（NoBuffer）时，都会写`skippedFrameReason`并提前返回，第6步的`getFrame()`就不会被调用。
 
 ### 5.3 syncFrameState()完成
 
 `syncFrameState()`返回后，`run()`按`canDrawThisFrame`决定：true则`CanvasContext::draw()`进入第6步；false则不画，直接`flushAndSubmit()`并`waitOnFences()`，这里的`waitOnFences()`是回收本帧已提交的内部异步工作，与后续Buffer的fence无关
 
-同步点之后UI线程已可继续处理消息。RenderThread拿到的是属性快照+DisplayList引用。这个快照机制依赖于RenderNode内的`mStagingDisplayList`和`mDisplayList`双缓存，`mStagingDisplayList`用于UI线程录制，`mDisplayList`用于RenderThread绘制
+同步点之后UI线程已可继续处理消息（`prepareTextures`为false时例外，它会等到`draw()`结束）。RenderThread拿到的是属性快照+DisplayList引用。这个快照机制依赖于RenderNode内的`mStagingDisplayList`和`mDisplayList`双缓存，`mStagingDisplayList`用于UI线程录制，`mDisplayList`用于RenderThread绘制。
 
 ## 第6步：从BLAST BufferQueue申请Buffer
 
@@ -754,7 +832,7 @@ void CanvasContext::draw(bool solelyTextureViewUpdates) {
 }
 ```
 
-`CanvasContext::draw()`在算完脏区域后调用`getFrame()`；`getFrame()`若有`mHardwareBuffer`就直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。参考SKia渲染管线`SkiaOpenGLPipeline`，它的`getFrame()`只把`mEglSurface`交给`mEglManager.beginFrame()`。
+`CanvasContext::draw()`在算完脏区域后调用`getFrame()`；`getFrame()`若有`mHardwareBuffer`就直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。以Skia的OpenGL管线`SkiaOpenGLPipeline`为例，它的`getFrame()`只把`mEglSurface`交给`mEglManager.beginFrame()`。
 
 ```cpp
 // frameworks/base/libs/hwui/renderthread/EglManager.cpp
@@ -771,7 +849,19 @@ Frame EglManager::beginFrame(EGLSurface surface) {
 }
 ```
 
-`eglBeginFrame()`由EGL实现落到`ANativeWindow_dequeueBuffer()`
+`eglBeginFrame()`在AOSP的EGL loader里只做转发：`eglApi.cpp`调`cnx->platform.eglBeginFrame()`，平台默认实现`egl_platform_entries.cpp:903`只校验display/surface。真正发起dequeue的是EGL驱动——它在需要back buffer时通过`ANativeWindow`函数表调`dequeueBuffer`，所以AOSP里能断言的调用栈从`Surface::hook_dequeueBuffer`开始：
+
+```text
+EGL驱动 -> ANativeWindow_dequeueBuffer(window, &buf, &fence)
+       -> Surface::hook_dequeueBuffer
+          -> ReliableSurface::hook_dequeueBuffer（HWUI注册的拦截器）
+             -> Surface::dequeueBufferInternal
+                -> Surface::dequeueBuffer
+                   -> BBQBufferQueueProducer::dequeueBuffer  未实现，调用BufferQueueProducer::dequeueBuffer
+                      -> BufferQueueProducer::dequeueBuffer
+```
+
+`ANativeWindow_dequeueBuffer()`只是查函数表：
 
 ```cpp
 // frameworks/native/libs/nativewindow/ANativeWindow.cpp
@@ -780,15 +870,13 @@ int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buf
 }
 ```
 
-```text
-window->dequeueBuffer(window, &buf, &fence)   // ANativeWindow_dequeueBuffer
-       ->Surface::hook_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd)
-        ->Surface::dequeueBuffer(sp<GraphicBuffer>*, int*)
-           ->BBQBufferQueueProducer::dequeueBuffer  未实现，调用BufferQueueProducer的dequeueBuffer
-            ->BufferQueueProducer::dequeueBuffer
-```
+dequeue发生的具体时机（beginFrame、首次绘制或swap）由驱动决定，AOSP不保证；但无论何时，都会先撞上HWUI装的拦截器。
 
 ### 6.2 dequeueBuffer
+
+HWUI并不直接把`Surface`交给EGL：`CanvasContext`用`ReliableSurface`包了一层，`ReliableSurface::init()`通过`ANativeWindow_setDequeueBufferInterceptor()`把`ReliableSurface::hook_dequeueBuffer`注册到Surface上。EGL驱动调`ANativeWindow_dequeueBuffer`时先进入`Surface::hook_dequeueBuffer`，它把请求转给已注册的拦截器；拦截器再回调`Surface::dequeueBufferInternal`走正常路径。
+
+`Surface::hook_dequeueBuffer()`是通用的拦截器入口：
 
 ```cpp
 // frameworks/native/libs/gui/Surface.cpp
@@ -811,7 +899,33 @@ int Surface::hook_dequeueBuffer(ANativeWindow* window,
 }
 ```
 
-拦截器中正常走落到`dequeueBufferInternal`
+对HWUI来说，这个拦截器就是`ReliableSurface`：正常路径先看有没有预取好的`mReservedBuffer`（有就直接给），没有才调`dequeueBufferInternal`；真实dequeue失败时它返回一块1x1的scratch buffer把本帧糊弄过去，`queueBuffer`时再识别出来丢掉，避免整个surface被判定为损坏。A17里buffer预取被`constexpr bool DISABLE_BUFFER_PREFETCH = true`关掉，所以正常情况下dequeue就发生在第6步。
+
+```cpp
+// frameworks/base/libs/hwui/renderthread/ReliableSurface.cpp（节选）
+int ReliableSurface::hook_dequeueBuffer(ANativeWindow* window,
+                                        ANativeWindow_dequeueBufferFn dequeueBuffer, void* data,
+                                        ANativeWindowBuffer** buffer, int* fenceFd) {
+    ReliableSurface* rs = reinterpret_cast<ReliableSurface*>(data);
+    // 预取命中：直接把预留的buffer和fence交出去
+    if (rs->mReservedBuffer) {
+        *buffer = rs->mReservedBuffer;
+        *fenceFd = rs->mReservedFenceFd.release();
+        rs->mReservedBuffer = nullptr;
+        return OK;
+    }
+    int result = dequeueBuffer(window, buffer, fenceFd);
+    if (result != OK) {
+        *buffer = rs->acquireFallbackBuffer(result);   // 1x1兜底buffer
+        *fenceFd = -1;
+        return *buffer ? OK : INVALID_OPERATION;
+    }
+    rs->mHasDequeuedBuffer = true;
+    return OK;
+}
+```
+
+拦截器中正常走到`dequeueBufferInternal`：
 
 ```cpp
 int Surface::dequeueBufferInternal(ANativeWindow* window, ANativeWindowBuffer** buffer,
@@ -845,7 +959,7 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
 }
 ```
 
-`dequeueBuffer`在`BLASTBufferQueueProducer`中未实现，调用`BufferQueueProducer`的`dequeueBuffer`
+`BBQBufferQueueProducer`没有重写`dequeueBuffer`，调用`BufferQueueProducer`的`dequeueBuffer`：
 
 ```cpp
 status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* outFence,
@@ -854,15 +968,19 @@ status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* ou
                                             FrameEventHistoryDelta* outTimestamps) {
     ATRACE_CALL();
     ...
+    // 循环：waitForFreeSlotThenRelock + 必要时分配GraphicBuffer
     mSlots[found].mBufferState.dequeue();
     ...
     addAndGetFrameTimestamps(nullptr, outTimestamps);
-}    
+    return returnFlags;   // 可能是 OK、WOULD_BLOCK 或 TIMED_OUT
+}
 ```
 
 ### 6.3 什么时候会在这里等待
 
-普通路径在拿不到空闲slot时调用`waitForBufferRelease()`，`BufferQueueProducer`的默认实现阻塞在`mDequeueCondition`上：
+`dequeueBuffer()`在`waitForFreeSlotThenRelock()`里拿不到空闲slot时调`waitForBufferRelease()`。先要区分两种情形：普通BufferQueue里若producer与consumer都由App控制、又没有显式设dequeue timeout，`mDequeueBufferCannotBlock`为true，函数会返回`WOULD_BLOCK`而不是死等；BLAST在`initialize()`里把timeout设成`int64_t`最大值，所以一定走阻塞等待。
+
+`BufferQueueProducer`的默认实现等`mDequeueCondition`：
 
 ```cpp
 // frameworks/native/libs/gui/BufferQueueProducer.cpp
@@ -898,7 +1016,9 @@ status_t waitForBufferRelease(std::unique_lock<std::mutex>& bufferQueueLock,
 }
 ```
 
-`mBufferReleaseReader`读`BufferReleaseChannel`，SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`，channel有数据后`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值，默认无限等待。
+`mBufferReleaseReader`读`BufferReleaseChannel`（epoll监听一个eventfd），SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`的`epoll_wait()`上，channel有数据后eventfd被写、epoll返回，`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值，默认无限等待。
+
+`waitForBufferRelease()`在返回前还会调`getWaitForBufferReleaseCallback()`，把“这次阻塞了多久”报给Choreographer：超过半帧就置位buffer stuffing，下一次`doFrame()`主动`DELAY_FRAME`一帧（见2.4）。所以第6步的阻塞和App侧的丢帧策略是连动的。
 
 ### 6.4 本步拿到的两样关键东西
 
@@ -975,7 +1095,13 @@ void SkiaPipeline::renderFrameImpl(const SkRect& clip,
                                    const SkMatrix& preTransform) {
     SkAutoCanvasRestore saver(canvas, true);
     auto clipRestriction = preTransform.mapRect(clip).roundOut();
-    canvas->androidFramework_setDeviceClipRestriction(clipRestriction);
+    if (CC_UNLIKELY(isCapturingSkp())) {
+        // 录SKP时不能把clip限制写进画布，否则回放会丢内容
+        canvas->drawAnnotation(SkRect::Make(clipRestriction), "AndroidDeviceClipRestriction",
+            nullptr);
+    } else {
+        canvas->androidFramework_setDeviceClipRestriction(clipRestriction);
+    }
     canvas->concat(preTransform);
     if (!opaque) {
         canvas->clear(SK_ColorTRANSPARENT);
@@ -988,6 +1114,7 @@ void SkiaPipeline::renderFrameImpl(const SkRect& clip,
     } else if (0 == nodes.size()) {
         // nothing to draw
     } else {
+        // 多node：backdrop / content / overlay
         ...
     }
 }
@@ -1024,7 +1151,7 @@ IRenderPipeline::DrawResult SkiaOpenGLPipeline::draw(
 
 ### 8.1 eglSwapBuffers到Surface::queueBuffer
 
-命令提交后，准备swapBuffer，据绘制结果和EGL状态决定是否把本帧缓冲区提交给系统
+命令提交后准备swapBuffer，由绘制结果和EGL状态决定是否把本帧缓冲区提交给系统：
 
 ```cpp
 void CanvasContext::draw(bool solelyTextureViewUpdates) {
@@ -1033,21 +1160,12 @@ void CanvasContext::draw(bool solelyTextureViewUpdates) {
     bool didSwap = mRenderPipeline->swapBuffers(
             frame, drawResult, windowDirty, mCurrentFrameInfo, &requireSwap);
     ...
-    // 处理Swap结果
-    if (requireSwap) {
-        ...
-        if (error == TIMED_OUT) {
-            mRenderThread.postFrameCallback(this);
-        } else if (error != OK || !didSwap) {
-            setSurface(nullptr);
-        }
-        ..
-    }
     mCurrentFrameInfo->markSwapBuffersCompleted();
-    // 通知帧提交回调
+    ...
+    // 通知帧提交回调：didSwap才是真的把buffer交给了BufferQueue
     if (didSwap) {
         for (auto& func : mFrameCommitCallbacks) {
-            std::invoke(func, true);
+            std::invoke(func, true /* didProduceBuffer */);
         }
         mFrameCommitCallbacks.clear();
     }
@@ -1090,11 +1208,13 @@ bool EglManager::swapBuffers(const Frame& frame, const SkRect& screenDirty) {
 `eglSwapBuffersWithDamageKHR()`由EGL驱动实现，最终调`ANativeWindow_queueBuffer()`，进入`Surface::hook_queueBuffer()`，再转成内部类型：
 
 ```text
-window->queueBuffer(window, buffer, fenceFd)   // ANativeWindow_queueBuffer
-  ->Surface::hook_queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
-        ->Surface::queueBuffer(const sp<GraphicBuffer>&, const sp<Fence>&, SurfaceQueueBufferOutput*)
-          ->Surface::queueBufferImpl()
-              ->BufferQueueProducer::queueBuffer()   // BBQ 未重写
+EGL驱动 -> ANativeWindow_queueBuffer(window, buffer, fenceFd)
+  ->Surface::hook_queueBuffer
+     ->ReliableSurface::hook_queueBuffer（HWUI拦截器：假buffer直接丢弃）
+        ->Surface::queueBufferInternal
+           ->Surface::queueBuffer(const sp<GraphicBuffer>&, const sp<Fence>&, SurfaceQueueBufferOutput*)
+              ->Surface::queueBufferImpl()
+                 ->BufferQueueProducer::queueBuffer()   // BBQ 未重写
 ```
 
 
@@ -1116,7 +1236,7 @@ int Surface::hook_queueBuffer(ANativeWindow* window,
 }
 ```
 
-拦截器中正常走落到`queueBufferInternal`
+拦截器正常情况下落到`queueBufferInternal`
 
 ```cpp
 int Surface::queueBufferInternal(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd) {
@@ -1155,7 +1275,7 @@ status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fenc
 }
 ```
 
-`queueBufferImpl()`先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队。`queueBuffer()`返回时并不等它：除非`Properties::waitForGpuCompletion`为true。消费者拿到的acquire fence会替它等。
+`queueBufferImpl()`先按buffer找出slot，再调用`mGraphicBufferProducer->queueBuffer(slot, igbpInput, &igbpOutput)`。`igbpInput`里的fence就是“GPU何时写完这块buffer”的signal fence，随buffer入队，App侧不会等它。但`BufferQueueProducer::queueBuffer()`末尾有一道EGL限流：`connectedApi == NATIVE_WINDOW_API_EGL && enableEglCpuThrottling`时，它会`lastQueuedFence->waitForever("Throttling EGL Production")`，等的是**上一帧**的GPU完成fence——最多允许两个buffer在途，不允许第三个。所以`queueBuffer()`本身可能在这里阻塞，但等的不是本帧的fence。`Properties::waitForGpuCompletion`是另一回事，它在`EglManager::swapBuffers()`里、swap之前同步等GPU，属于调试开关。
 
 ### 8.2 queueBuffer与onFrameAvailable
 
@@ -1186,9 +1306,9 @@ status_t BufferQueueProducer::queueBuffer(int slot,
 }
 ```
 
-`BufferQueueProducer::queueBuffer`中完成了对`BufferItem`的包装，`BufferItem`包含了缓冲区的句柄以及所有相关的元数据，如mGraphicBuffer, mFence, mSlot, mFrameNumber
+`BufferQueueProducer::queueBuffer`中完成了对`BufferItem`的包装，`BufferItem`包含了缓冲区的句柄以及所有相关的元数据，如mGraphicBuffer, mFence, mSlot, mFrameNumber；listener是`BLASTBufferQueue`自己（它实现了`ConsumerBase::FrameAvailableListener`，不是另一个consumer对象）。
 
-`queueBuffer`落到`BLASTBufferQueue::onFrameAvailable()`。
+`queueBuffer`落到`BLASTBufferQueue::onFrameAvailable()`。注意这里没有Binder跨越：BLASTBufferQueue和BufferQueue都在App进程，listener是在调用`queueBuffer()`的RenderThread上同步回调的，所以第8步和第9步的acquire发生在同一个线程、同一段调用栈里。
 
 ### 8.3 onFrameAvailable里的计数
 
@@ -1220,9 +1340,9 @@ void BLASTBufferQueue::onFrameAvailable(const BufferItem& item) {
 
 Perfetto里看到的是`QueuedBuffer - VRIBLAST#N`。值是`mNumFrameAvailable + mNumAcquired - mPendingRelease.size()`，含义是App已queue、尚未被SurfaceFlinger释放回去的buffer总数，不是BufferQueue内部队列长度。
 
-`mNumFrameAvailable`在queue时+1，在`acquireNextBufferLocked`中-1；`mNumAcquired`在`acquireNextBufferLocked`中+1，在`releaseBuffer()`里-1
+`mNumFrameAvailable`在queue时+1；-1有两处：`acquireNextBufferLocked()`成功acquire时，以及`acquireAndReleaseBuffer()`（sync事务丢弃/排空影子队列）时。`mNumAcquired`在`acquireNextBufferLocked()`中+1，在`releaseBuffer()`里-1。被`rejectBuffer()`拒绝的buffer只走`mNumFrameAvailable--`，不会+`mNumAcquired`。
 
-`mNumAcquired`不能超过`mMaxAcquiredBuffers + 2`。`acquireNextBufferLocked()`开头就做这两项检查，超过时返回`NO_BUFFER_AVAILABLE`，`onFrameAvailable()`在条件变量上等待
+`mNumAcquired`不能超过`mMaxAcquiredBuffers + 2`。`acquireNextBufferLocked()`开头就做这两项检查，超过时返回`NO_BUFFER_AVAILABLE`；但只有在sync事务路径（`mTransactionReadyCallback != nullptr`）里`onFrameAvailable()`才会在`mCallbackCV`上等，普通路径直接忽略返回值——这一帧继续留在影子队列里，等`releaseBufferCallbackLocked()`或事务回调把buffer还回来后再acquire。
 
 ## 第9步：BLAST Consumer把buffer提交给SurfaceFlinger
 
@@ -1249,6 +1369,8 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(const std::optional<SurfaceCo
     ...
     auto buffer = bufferItem.mGraphicBuffer;
     mNumFrameAvailable--;
+    ...
+    // buffer为空、或尺寸不符时releaseBuffer后递归重试，这条路径不会再++mNumAcquired
     mNumAcquired++;
     mLastAcquiredFrameNumber = bufferItem.mFrameNumber;
     ReleaseCallbackId releaseCallbackId(buffer->getId(), mLastAcquiredFrameNumber);
@@ -1263,49 +1385,74 @@ status_t BLASTBufferQueue::acquireNextBufferLocked(const std::optional<SurfaceCo
     t->setSurfaceDamageRegion(...);
     t->addTransactionCompletedCallback(makeTransactionCallbackThunk(), nullptr);
     ...
+    mergePendingTransactions(t, bufferItem.mFrameNumber);
     if (applyTransaction) {
         t->setApplyToken(mApplyToken).apply(false, true);
         mAppliedLastTransaction = true;
         mLastAppliedFrameNumber = bufferItem.mFrameNumber;
+        mSetBufferBarrier = true;
     } else {
         // 等同一Surface上帧号为mLastAppliedFrameNumber的buffer
-        t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber);
+        if (mSetBufferBarrier) {
+            t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber);
+        }
         mAppliedLastTransaction = false;
     }
     ...
 }
 ```
 
-- `acquireBuffer()`拿到`BufferItem`，其`mFence`就是生产者queue时的GPU完成fence，在SurfaceFlinger侧作为acquire fence。
+- `acquireBuffer()`拿到`BufferItem`，其`mFence`就是生产者queue时的GPU完成fence，在SurfaceFlinger侧作为acquire fence。第三个参数`false`是`waitForFence`，表示消费端**不**在这里等fence，而是把它随`setBuffer()`交给SF，由SF latch时判断（`latchBufferImpl()`里的`fenceHasSignaled()`）。
 - `mNumFrameAvailable--`、`mNumAcquired++`：从“可用”变成“已acquire”。
 - `mSubmitted[ReleaseCallbackId(buffer->getId(), frameNumber)]`记录buffer id和frame number，SF释放时用这个映射找回`BufferItem`。
 - `setBuffer()`写入buffer和acquire fence，并带上第13步要用的`releaseBufferCallback`。
 - `setDataspace()`、`setHdrMetadata()`、`setSurfaceDamageRegion()`在同一个事务里提交数据空间、HDR元数据、脏区域。
 - `addTransactionCompletedCallback()`注册事务完成回调，供`TransactionCompletedListener`使用。
 - `setApplyToken(mApplyToken).apply(false, true)`：token让SF按队列排序，`synchronous=false`不等提交完成，`oneWay=true`走单向Binder，详见9.2。
-- `t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber)`等待在`mLastAppliedFrameNumber`对应的buffer完成后再应用事务
+- `t->setBufferHasBarrier(mSurfaceControl, mLastAppliedFrameNumber)`：只有在`mSetBufferBarrier`为true（之前apply过带buffer的事务）时才加，让本帧事务等同一Surface上帧号为`mLastAppliedFrameNumber`的buffer先完成。
 
 ### 9.2 apply：从客户端到SF的事务队列
 
 `setApplyToken(mApplyToken)`只是把token存进`Transaction`，真正的提交在`apply(false, true)`
 
 ```cpp
-status_t Transaction::apply(bool synchronous, bool oneWay) {
+// frameworks/native/libs/gui/SurfaceComposerClient.cpp
+status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay) {
+    if (mStatus != NO_ERROR) {
+        return mStatus;
+    }
+    // SyncCallback恒创建，但只有synchronous才init并注册
+    std::shared_ptr<SyncCallback> syncCallback = std::make_shared<SyncCallback>();
+    if (synchronous) {
+        syncCallback->init();
+        addTransactionCommittedCallback(SyncCallback::getCallback(syncCallback),
+                                        /*callbackContext=*/nullptr);
+    }
     ...
     cacheBuffers();                       // BufferCache 命中就把 buffer 换成 cacheId
-    if (oneWay && !synchronous) {
-        mState.mFlags |= ISurfaceComposer::eOneWay;
+    if (oneWay) {
+        if (synchronous) {
+            ALOGE("Transaction attempted to set synchronous and one way at the same time"
+                  " this is an invalid request. Synchronous will win for safety");
+        } else {
+            mState.mFlags |= ISurfaceComposer::eOneWay;
+        }
     }
+    ...
     sp<IBinder> applyToken = mApplyToken ? mApplyToken : getDefaultApplyToken();
     sp<ISurfaceComposer> sf(ComposerService::getComposerService());
     TransactionState state = std::move(mState);
     status_t binderStatus = sf->setTransactionState(std::move(state), applyToken);
     clear();
-    ...
+    if (synchronous && binderStatus == OK) {
+        syncCallback->wait();
+    }
+    mStatus = NO_ERROR;
+    return binderStatus;
 }
 ```
 
-两个参数`synchronous=false`：不注册`SyncCallback`，不等事务提交完成；`oneWay=true`：给`mState.mFlags`置`ISurfaceComposer::eOneWay`，Binder proxy据此用`FLAG_ONEWAY`发起transact；然后`sf->setTransactionState(std::move(state), applyToken)`，`clear()`后返回
+两个参数`synchronous=false`：`SyncCallback`虽然会创建，但不init、不注册、也不`wait()`；`oneWay=true`：给`mState.mFlags`置`ISurfaceComposer::eOneWay`，Binder proxy据此用`FLAG_ONEWAY`发起transact；然后`sf->setTransactionState(std::move(state), applyToken)`，`clear()`后返回。注意`Transaction::apply()`在`SurfaceComposerClient.cpp`里，不在`Transaction.cpp`。
 
 ```cpp
 // frameworks/native/libs/gui/ISurfaceComposer.cpp
@@ -1330,8 +1477,8 @@ status_t BpSurfaceComposer::setTransactionState(TransactionState&& state, const 
 
 - 识别调用者并裁剪权限：读取getCallingPid/Uid，对每个`layer_state_t`、`display_state`执行`sanitize(permissions)`，把无权改的字段静默抹掉
 - 处理buffer缓存：按`uncacheBuffers`调用`ClientCache::erase()`，释放客户端不再需要的cache条目
-- 所有的`transactionState.mComposerStates`解析成`ResolvedComposerState`，成功后执行mBufferCountTracker.increment()，`BufferTX -`计数+1
-- 封装`QueuedTransactionState`，`frameTimelineInfo`、`resolvedStates`、`flags`、`applyToken`、等等全部封装进`QueuedTransactionState`
+- `transactionState.mComposerStates`逐条解析成`ResolvedComposerState`；其中`hasBufferChanges() && hasValidBuffer() && surface`的才执行`mBufferCountTracker.increment()`，`BufferTX -`计数+1
+- 封装`QueuedTransactionState`，`frameTimelineInfo`、`resolvedStates`、`flags`、`applyToken`、barriers、early wakeup info等全部封装进去
 - `QueuedTransactionState`进入无锁队列：mTransactionHandler.queueTransaction()只做push和`PendingTransactionCount`计数，不会被主线程commit阻塞Binder线程；oneway下客户端连这一步的返回都不等
 - `setTransactionFlags()`
 
@@ -1357,8 +1504,8 @@ void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule sche
 
 1. `modulateVsync()`用于调整VSync调度策略，决定SF提前/延后多久醒
 2. Binder线程`fetch_or(mask)`置位，SF主线程`commit()`里 `clearTransactionFlags(mask)` 取走，并据此决定`flushTransactions`。`fetch_or(mask)`的返回值是旧值，`transactionFlags & mask` 为 0 说明之前没排过，才需要真正叫醒 SF；否则说明已经有在途调度，不重复排，新事务会被已经排好的那一帧一起flush掉，同一帧内不管来多少笔事务（多个 App、同一 App多次apply），只有第一笔会触发`resync` + `scheduleCommit`，后面的只置位
-3. 如果没有被排过走`resync() + scheduleCommit()`:`resync()`:由于SF是被外部事务叫醒的，可能已经偏离预测的Vsync时间轴，所以要拿硬件Vsync重新对齐预测器;`scheduleCommit()`最终落到`mScheduler->scheduleFrame()`，在SF自己的`MessageQueue`上arm一次VSync预约。“提前多久、几点醒”是第10步的主题，这里只记住一句：**事务到达SF时，唤醒SF的那个定时器已经被排好了**
-4. 如果被排过了，还是要走`mScheduler->resetAllIdleTimers()`，保证这帧不会被Display显示器的idle状态拖住
+3. 如果没有被排过走`resync() + scheduleCommit()`:`resync()`内部还有节流——同一调用方在`VSyncTracker::kPredictorThreshold`（默认200ms）内只真正对齐一次，避免每笔事务都去摸硬件Vsync；`scheduleCommit()`最终落到`mScheduler->scheduleFrame()`，在SF自己的`MessageQueue`上arm一次VSync预约。“提前多久、几点醒”是第10步的主题，这里只记住一句：**事务到达SF时，唤醒SF的那个定时器已经被排好了**
+4. 如果被排过了，且`frameHint == FrameHint::kActive`，还是要走`mScheduler->resetAllIdleTimers()`，保证这帧不会被Display显示器的idle状态拖住
 
 ### 9.5 BufferTX计数
 
@@ -1392,7 +1539,7 @@ name为`const std::string mBlastTransactionName{"BufferTX - " + mName};`，`Buff
 - buffer所有权已通过`Transaction`交给SurfaceFlinger的待处理事务队列。
 - SF还没应用事务，`Layer::mDrawingState.buffer`未更新。
 - `BufferTX`已+1。
-- 这次事务已经在`setTransactionFlags()`里置位`mTransactionFlushNeeded`，并在需要时`scheduleCommit()`排好了一次`Vsync-sf`唤醒
+- 这次事务已经在`setTransactionFlags()`里置位`mTransactionFlags`的`eTransactionFlushNeeded`位（没有单独的`mTransactionFlushNeeded`成员），并在需要时`scheduleCommit()`排好了一次`Vsync-sf`唤醒
 
 到第9步结束，App这一侧的活已经干完
 
@@ -1404,7 +1551,7 @@ name为`const std::string mBlastTransactionName{"BufferTX - " + mName};`，`Buff
 
 SF侧没有单独的调度器线程：`class Scheduler : public IEventThreadCallback, android::impl::MessageQueue`,`Scheduler`本身就是“消息队列 + VSync预约器”
 
-`setTransactionState()`末尾的`setTransactionFlags()`如果发现这一帧还没排过调度，于是`resync()`把预测器对齐到硬件vsync，再由`scheduleCommit()`落到`mScheduler->scheduleFrame()`。
+`setTransactionState()`末尾的`setTransactionFlags()`如果发现这一帧还没排过调度，于是`resync()`（受200ms节流）把预测器对齐到硬件vsync，再由`scheduleCommit()`落到`mScheduler->scheduleFrame()`。
 
 ```cpp
 // frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp:2508
@@ -1431,16 +1578,61 @@ void MessageQueue::scheduleFrame(Duration workDurationSlack) {
 }
 ```
 
-`mVsync.registration`是`VSyncCallbackRegistration`，在`onNewVsyncScheduleLocked()`里创建，绑定的回调是`vsyncCallback`，名字叫`"sf"`
-SF中`VSyncCallbackRegistration`的来历参考[mScheduler->initVsync](../Scheduler相关/Scheduler#initVsync)
-SF中`VSyncCallbackRegistration::schedule`参考[schedule](../VsyncSchedule相关/VsyncSchedule.md#VSyncCallbackRegistration::schedule)
+`mVsync.registration`是`VSyncCallbackRegistration`，在`onNewVsyncScheduleLocked()`里创建，绑定的回调是`vsyncCallback`，名字叫`"sf"`。
+SF中`VSyncCallbackRegistration`的来历参考[mScheduler->initVsync](../Scheduler相关/Scheduler.md#initVsync)；
+SF中`VSyncCallbackRegistration::schedule`参考[schedule](../VsyncSchedule相关/VsyncSchedule.md#VSyncCallbackRegistration::schedule)。
+
+### 10.2 workDuration、readyDuration与VsyncModulator
+
+App和SF的唤醒点都由同一个`VsyncConfig`派生，只是取了不同字段。`SurfaceFlinger::initScheduler()`里：
+
+```cpp
+// frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp:5216
+const auto configs = mScheduler->getCurrentVsyncConfigs();
+mScheduler->createEventThread(mFrameTimeline->getTokenManager(),
+                              /* workDuration */ configs.late.appWorkDuration,
+                              /* readyDuration */ configs.late.sfWorkDuration);
+mScheduler->initVsync(*mFrameTimeline->getTokenManager(), configs.late.sfWorkDuration);
+```
+
+配置变化时`Scheduler::setVsyncConfig()`把同一组值分发给两边：
+
+```cpp
+// frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp:802
+void Scheduler::setVsyncConfig(const VsyncConfig& config) {
+    setDuration(/* workDuration */ config.appWorkDuration,
+                /* readyDuration */ config.sfWorkDuration);
+    setDuration(config.sfWorkDuration);
+}
+```
+
+带两个参数的`setDuration()`给App的`EventThread`，带一个参数的给SF自己的`MessageQueue`。于是同一条Vsync时间轴被切成两段：
+
+```text
+        App 唤醒                 App deadline / SF 唤醒             vsync
+  ----------|----------------------------|---------------------------|---->
+   vsync-(appWorkDuration+sfWorkDuration)  vsync - sfWorkDuration     vsync
+```
+
+- App：`workDuration = appWorkDuration`、`readyDuration = sfWorkDuration`，即“提前`appWorkDuration + sfWorkDuration`醒，可用工作窗口是`appWorkDuration`，最晚在`vsync - sfWorkDuration`前把buffer交出去”。
+- SF：`workDuration = sfWorkDuration`、`readyDuration = 0`，即“提前`sfWorkDuration`醒，deadline就是vsync本身”。
+
+这解释了第6步的dequeue为什么不能拖：App错过自己的readyTime，SF这一帧就来不及latch新buffer，只能拿旧buffer或跳过合成。
+
+`VsyncConfig`有三套配置（`early`/`earlyGpu`/`late`），由`VsyncModulator`选：
+
+- `early`：有`eEarlyWakeupStart`请求、正在切刷新率、或刚提交过事务后的一小段窗口；
+- `earlyGpu`：最近几帧用过GPU合成（`onDisplayRefresh(usedGpuComposition)`）；
+- `late`：默认。
+
+`VsyncModulator::updateVsyncConfigLocked()`切换时会写`SFTRACE_INT("Vsync-Early")`、`"Vsync-EarlyGpu"`、`"Vsync-Late"`，Perfetto里能直接看到当前用哪套。`VsyncConfiguration`把`sfOffset`/`appOffset`换算成`sfWorkDuration`/`appWorkDuration`，所以底层配置其实还是“相位偏移”，只是调度器用“工作窗口”表达。
 
 ### 10.3 选哪一次vsync、几点醒：VSyncDispatchTimerQueue
 
 `schedule()`最终落到`VSyncDispatchTimerQueueEntry::schedule()`
 
 ```cpp
-// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp
+// frameworks/native/services/surfaceflinger/Scheduler/VSyncDispatchTimerQueue.cpp:90
 ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTiming timing,
                                                       VSyncTracker& tracker, nsecs_t now) {
     SFTRACE_NAME("VSyncDispatchTimerQueueEntry::schedule");
@@ -1453,15 +1645,15 @@ ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTim
                                                          timing.lastVsync));
     // 定时器必须在VSync之前workDuration + readyDuration就醒来，留足准备时间
     auto nextWakeupTime = nextVsyncTime - timing.workDuration - timing.readyDuration;
-    // 新算出的VSync比上次的目标VSync晚了超过一个周期，代表新Vsync超过太多，可能跳过实际需要的Vsync
+    // 新算出的VSync比已armed的VSync晚超过mMinVsyncDistance（3ms），说明会跳过原本要响的那次
     bool const wouldSkipAVsyncTarget =
             mArmedInfo && (nextVsyncTime > (mArmedInfo->mActualVsyncTime + mMinVsyncDistance));
-    // 新的唤醒时间比上次的唤醒时间晚了超过一个周期，将会跳过需要的唤醒
+    // 新的唤醒时间比已armed的唤醒时间晚超过mMinVsyncDistance，唤醒也会被跳过
     bool const wouldSkipAWakeup =
             mArmedInfo && ((nextWakeupTime > (mArmedInfo->mActualWakeupTime + mMinVsyncDistance)));
     SFTRACE_FORMAT_INSTANT("%s: wouldSkipAVsyncTarget=%d wouldSkipAWakeup=%d", mName.c_str(),
                            wouldSkipAVsyncTarget, wouldSkipAWakeup);
-    // 如果跳过tracker给出的预测Vsync和WakeupTime，对齐到mArmedInfo->mActualVsyncTime
+    // 会跳过就退回已armed的那次vsync，宁可早响也不漏响
     if (wouldSkipAVsyncTarget || wouldSkipAWakeup) {
         nextVsyncTime = mArmedInfo->mActualVsyncTime;
     // 不需要跳过就微调
@@ -1479,8 +1671,9 @@ ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTim
 ```
 
 - `nextAnticipatedVSyncTimeFrom(max(lastVsync, now + workDuration + readyDuration))`取的是从现在起还留得出工作时间的最早那次vsync
-- `nextWakeupTime = nextVsyncTime - workDuration - readyDuration`。SF的`readyDuration`是0，所以SF在目标vsync前`workDuration`醒来；对于APP来说，`workDuration`是自己的工作时间，`readyDuration`通常是SF的`workDuration`，这个结论在`Scheduler`中创建APP的`EventThread`的时候可以得出
-- `adjustVsyncIfNeeded()`防止同一帧被响应两次：如果这次vsync已经派发过，或者新目标离上次派发不足一个周期，就顺延到下一次。
+- `nextWakeupTime = nextVsyncTime - workDuration - readyDuration`。SF的`readyDuration`是0，所以SF在目标vsync前`workDuration`醒来；对于APP来说，`workDuration`是自己的工作时间，`readyDuration`通常是SF的`workDuration`，这个结论在`Scheduler`中创建APP的`EventThread`的时候可以得出（见10.2）
+- `wouldSkipAVsyncTarget`/`wouldSkipAWakeup`比较的是`mMinVsyncDistance`，不是“一个周期”。这个值由`VsyncSchedule`传入`kSnapToSameVsyncWithin = 3ms`：新目标比已armed的vsync/wakeup晚3ms以上就沿用已armed的那次，避免把定时器一路推到下一个vsync。
+- `adjustVsyncIfNeeded()`防止同一帧被响应两次：如果这次vsync已经派发过，或者新目标离上次派发不足`mMinVsyncDistance`，就顺延到下一次。
 
 vsync时间本身来自`VsyncTracker`的预测：它吃硬件vsync采样`addResyncSample()`来校准，也吃第13步的present fence的`Scheduler::addPresentFence()`。预测准不准，取决于上一帧真实上屏的时刻。
 
@@ -1517,9 +1710,9 @@ void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, ns
 
 `vsyncCallback`跑在`VSyncDispatchTimerQueue`的定时器线程上，不是SF主线程；它只做四件事：
 
-1. `mVsync.value`取反，Perfetto里`VSYNC-sf`翻转。
-2. 记下`lastCallbackTime`，并`mVsync.scheduledFrameTimeOpt.reset()`——这次预约已兑现，`getScheduledFrameResult()`从此返回空。
-3. 生成`VsyncId`：`TokenManager`把`targetWakeupTime`、`readyTime`、`vsyncTime`一起编码成一个token。同一帧在App侧和SF侧各有一个VsyncId，都由这个`TokenManager`生成、只是取各自的预测，FrameTimeline用它们把surface frame和display frame对上。
+1. `mVsync.value`取反，Perfetto里`VSYNC-sf`翻转（`TracedOrdinal<int> value = {"VSYNC-sf", 0}`）。
+2. 记下`lastCallbackTime`，并`mVsync.scheduledFrameTimeOpt.reset()`——这次(wakeup, vsync)预约已兑现。注意`getScheduledFrameResult()`不会因此返回空：它先看`mHandler->isFramePending()`，`dispatchFrame()`刚把pending置true，所以在此之前仍能拿到`expectedVsyncTime`；两者都没有才返回`nullopt`。
+3. 生成`VsyncId`：`TokenManager::generateTokenForPredictions()`取一个自增token号（`mCurrentToken++`），把`targetWakeupTime`、`readyTime`、`vsyncTime`按token号存进`mPredictions`表。同一帧在App侧和SF侧各有一个VsyncId，都由这个`TokenManager`生成、只是取各自的预测，FrameTimeline用它们把surface frame和display frame对上。
 4. `dispatchFrame()`把帧消息投给SF主线程。commit和composite都在主线程做，定时器线程到这里就交棒了。
 
 ### 10.5 主线程醒来：dispatchFrame到onFrameSignal
@@ -1541,11 +1734,11 @@ void MessageQueue::Handler::handleMessage(const Message&) {
 }
 ```
 
-`mFramePending`保证帧消息不堆叠：主线程还没处理完上一帧时，新到的帧信号被直接丢弃，也不会覆盖已经存好的`mVsyncId`——队列里那条消息仍是最早那次vsync的。代价是这一帧的合成顺延到下一次唤醒，好处是SF不会为错过的vsync补跑、堆积。
+`mFramePending`保证帧消息不堆叠，但它的窗口比“主线程还没处理完上一帧”更窄：`dispatchFrame()`在消息入队前`exchange(true)`，`handleMessage()`一进来就`store(false)`，所以真正的丢弃只发生在“上一条帧消息已经`sendMessage()`、还没被Looper取出”的这段时间。主线程正在`onFrameSignal()`里commit/composite时新到的vsync会照常再入一条消息排队，不会覆盖`mVsyncId`。代价是极端情况下SF会连做两帧，好处是不会为错过的vsync补跑一串。
 
 `handleMessage()`由`mLooper`在SF主线程上调用，就是`Scheduler::run()`里`waitMessage()`的`pollOnce(-1)`返回处。`onFrameSignal()`在`MessageQueue`里是纯虚函数（`MessageQueue.h:115`），由`Scheduler`实现（`Scheduler.h:396`）。
 
-到这里，SF主线程手上只有三样东西：`vsyncId`、`expectedVsyncTime`，以及“这一帧要干活”的隐含信号。它进入`Scheduler::onFrameSignal()`（`Scheduler.cpp:411`）——第11步正是从那里开始：`beginFrame()`把`expectedVsyncTime`换算成本帧的`expectedPresentTime`，然后`commit()`去latch第9步送来的那块buffer。
+到这里，SF主线程手上只有三样东西：`vsyncId`、`expectedVsyncTime`，以及“这一帧要干活”的隐含信号。它进入`Scheduler::onFrameSignal()`（`Scheduler.cpp:411`）——第11步正是从那里开始：`beginFrame()`接收这三个值，由`FrameTargeter`算出本帧的`expectedPresentTime`，然后`commit()`去latch第9步送来的那块buffer。
 
 和App侧第2步对照：那边是`VSYNC-app`翻转后进`Choreographer.doFrame()`，这边是`VSYNC-sf`翻转后进`onFrameSignal()`；两边共享同一个`VsyncTracker`，唤醒点分别由`appWorkDuration`和`sfWorkDuration`决定，一个覆盖UI线程的录制，一个覆盖commit+composite。
 
@@ -1559,6 +1752,9 @@ void MessageQueue::Handler::handleMessage(const Message&) {
 // frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp:411
 void Scheduler::onFrameSignal(ICompositor& compositor, VsyncId vsyncId,
                               TimePoint expectedVsyncTime) {
+    const auto debugPresentDelay = mDebugPresentDelay.load();
+    mDebugPresentDelay.store(std::nullopt);
+
     const FrameTargeter::BeginFrameArgs beginFrameArgs =
             {.frameBeginTime = mClock->now(),
              .vsyncId = vsyncId,
@@ -1573,17 +1769,24 @@ void Scheduler::onFrameSignal(ICompositor& compositor, VsyncId vsyncId,
         targets.try_emplace(pacesetterPtr->displayId, &pacesetterPtr->targeterPtr->target());
         ...
         if (!compositor.commit(pacesetterPtr->displayId, targets)) {
+            compositor.sendNotifyExpectedPresentHint(pacesetterPtr->displayId);
             mSchedulerCallback.onCommitNotComposited();
             return;
         }
     }
     ...
     const auto resultsPerDisplay = compositor.composite(pacesetterPtr->displayId, targeters);
-    ...
+    compositor.sendNotifyExpectedPresentHint(pacesetterPtr->displayId);
+    compositor.sample();
+    for (const auto& [id, targeter] : targeters) {
+        const auto resultOpt = resultsPerDisplay.get(id);
+        LOG_ALWAYS_FATAL_IF(!resultOpt);
+        targeter->endFrame(*resultOpt);
+    }
 }
 ```
 
-`beginFrame()`算出`expectedPresentTime`、`frameBeginTime`、`vsyncId`。`pacesetter`是主显示器，其他显示器的Vsync以它为基准；17上还有`follower_display_backpressure_combined`逻辑，follower有未完成的present fence时可以跳过本帧。`commit()`返回false时不进入composite。
+`beginFrame()`的入参是`frameBeginTime`、`vsyncId`、`expectedVsyncTime`，`FrameTargeter::beginFrame()`再据此算出`expectedPresentTime`：目标vsync不早于`frameBeginTime`时直接用它，否则取`frameBeginTime`之后的下一个vsync deadline（若`sfWorkDuration`超过一个vsync周期，再顺延一个周期）。`pacesetter`是主显示器，其他显示器的Vsync以它为基准；17上还有`follower_display_backpressure_combined`逻辑，非lockstep的follower有未完成的present fence时，这一帧只把该follower从targets里排除（`continue`），pacesetter照常commit/composite，而不是整帧跳过。`commit()`返回false时直接返回，不进入composite。
 
 ### 11.2 SurfaceFlinger::commit
 
@@ -1628,24 +1831,30 @@ commit做四件事：
 
 1. 检查display集合与mode set。display被移除时先`processDisplayChangesLocked()`再重试；mode set未完成则`scheduleFrame()`等下一次。
 2. 检查HWC背压。上一帧HWC未present完且当前需要GPU合成时，按slack重新调度commit。
-3. `updateLayerSnapshots()`（3138）应用事务并latch buffer。`applyTransactionState()`把待处理事务合并进layer状态，`latchBufferImpl()`把`mDrawingState.buffer`换成新buffer，更新`mBufferInfo`。
+3. `updateLayerSnapshots()`（3138）应用事务并latch buffer。`applyTransactionState()`在应用事务时就把`mDrawingState.previousBuffer`/`mDrawingState.buffer`换成了新buffer；`latchBufferImpl()`只把`mDrawingState`里的buffer、fence、frameNumber提交到`mBufferInfo`。
 4. `chooseRefreshRateForContent()`（3179）按可见layer的frame rate投票、touch boost、游戏模式等选刷新率。必须在latch之后，因为要用刚latch进来的状态。
 
-`mustComposite`为false时commit返回false，SF不进入composite，屏幕内容没有变化。
+`mustComposite`为false时commit返回false，SF不进入composite，屏幕内容没有变化；另外`mBootStage == BootStage::BOOTLOADER`阶段也返回false，此时SF还没有正式接管屏幕。
 
 ### 11.3 latchBufferImpl
 
-`latchBufferImpl()`（1506）先检查sideband stream，再检查新buffer的acquire fence是否signal，然后调用`gatherBufferInfo()`：
+`latchBufferImpl()`（1506）先处理sideband stream，再检查新buffer的acquire fence是否signal，未signal就`onLayerUpdate()`后返回false（本帧这个layer不参与合成），signal了才`latchBufferStatsAndHandles()`、`gatherBufferInfo()`：
 
 ```cpp
-// Layer.cpp:1506
+// frameworks/native/services/surfaceflinger/Layer.cpp:1506
 bool Layer::latchBufferImpl(bool& recomputeVisibleRegions, nsecs_t latchTime,
                             nsecs_t expectedPresentTime, bool bgColorOnly) {
-    ...
+    bool refreshRequired = latchSidebandStream(recomputeVisibleRegions);
+    if (refreshRequired) {
+        return refreshRequired;
+    }
+    // 新buffer的acquire fence还没signal，等下一次
     if (mDrawingState.buffer && !fenceHasSignaled()) {
+        SFTRACE_NAME("!fenceHasSignaled()");
         mFlinger->onLayerUpdate();
         return false;
     }
+    latchBufferStatsAndHandles(latchTime, expectedPresentTime, bgColorOnly);
     ...
     gatherBufferInfo();
     ...
@@ -1655,11 +1864,12 @@ bool Layer::latchBufferImpl(bool& recomputeVisibleRegions, nsecs_t latchTime,
 真正更新计数和上一帧回调id的是`gatherBufferInfo()`（1299）：
 
 ```cpp
-// Layer.cpp:1299
+// frameworks/native/services/surfaceflinger/Layer.cpp:1299
 void Layer::gatherBufferInfo() {
     mPreviousReleaseCallbackId = {getLatchedBufferId(), mBufferInfo.mFrameNumber};
     mPreviousReleaseBufferEndpoint = mBufferInfo.mReleaseBufferEndpoint;
     ...
+    // 只有确实换了buffer才减BufferTX
     if ((!mBufferInfo.mBuffer || !mDrawingState.buffer->hasSameBuffer(*mBufferInfo.mBuffer))) {
         decrementPendingBufferCount();
     }
@@ -1673,7 +1883,7 @@ void Layer::gatherBufferInfo() {
 }
 ```
 
-`decrementPendingBufferCount()`（1410）使`BufferTX`-1。latch之后buffer从“已到达未使用”变成“即将被合成”，`mPreviousReleaseCallbackId`记下上一帧buffer，供第13步释放。
+`decrementPendingBufferCount()`（1410）使`BufferTX`-1。latch之后buffer从“已到达未使用”变成“即将被合成”，`mPreviousReleaseCallbackId`记下上一帧buffer，供第13步释放。注意`mDrawingState.buffer`不是在这里换的：`Layer::applyTransactionState()`应用事务时就已经`mDrawingState.previousBuffer = std::move(mDrawingState.buffer); mDrawingState.buffer = std::move(buffer);`，latch只是把它提交到`mBufferInfo`。
 
 ## 第12步：composite与HWC协商
 
@@ -1788,13 +1998,18 @@ status_t HWComposer::getDeviceCompositionChanges(
 }
 ```
 
-HWC的`validate()`返回后，SF从HWC读三类信息：
+HWC的`validate()`返回后，SF从HWC读四类信息：
 
 - `getChangedCompositionTypes()`：哪些layer要改合成方式。最关键的是把某个layer从`DEVICE`改成`CLIENT`，即“HWC合成不了，请用GPU画到client target”。
 - `getRequests()`：显示级请求（如`FLIP_CLIENT_TARGET`）和layer级请求（清除、亮度、色彩变换）。
 - `getClientTargetProperty()`：client target buffer的dataspace和像素格式。
+- `getRequestedLuts()`：layer级的LUT（色彩查找表）请求。
+
+读完之后还要`acceptChanges()`，HWC才会接受这组合成决策并允许后续present；漏掉这一步，`present()`会直接失败。
 
 `applyCompositionStrategy()`（295）把`changedTypes`、`displayRequests`、`layerRequests`、`clientTargetProperty`、`layerLuts`逐项落到layer/output状态，最后重算`usesClientComposition`与`usesDeviceComposition`。
+
+快速路径要注意：`canSkipValidate`为true且`presentOrValidate()`返回`state == 1`（本帧已经present成功）时，`getDeviceCompositionChanges()`在`getReleaseFences()`、存好`lastPresentFence`和`validateWasSkipped = true`后就返回，上面这四类读取和`acceptChanges()`全都不执行。
 
 `usesClientComposition`为true时，`finishFrame()`会dequeue一块client target buffer，用RenderEngine（GPU）把需要client合成的layer画进去，再把client target作为一个layer交给HWC。`usesDeviceComposition`为true时，至少部分layer由HWC直接扫描。layer能否走HWC合成涉及格式、缩放、色彩空间、叠加限制、保护内容等条件，最终由vendor的HWC HAL决定。
 
@@ -1840,7 +2055,7 @@ compositionengine::Output::FrameFences Display::presentFrame() {
 }
 ```
 
-`HWComposer::presentAndGetReleaseFences()`（658）里，如果上一轮validate被跳过，它会显式`executeCommands()`并直接复用已经拿到的present fence；否则先`hwcDisplay->present(&displayData.lastPresentFence)`，再`getReleaseFences()`取回每个HWC layer的release fence。提交结束，但像素还没稳定，present fence继续跟踪。
+`HWComposer::presentAndGetReleaseFences()`（658）里，如果**本帧**的validate被跳过（即`presentOrValidate()`在validate阶段就已经present成功），它会显式`executeCommands()`并直接复用已经存好的present fence；否则先`hwcDisplay->present(&displayData.lastPresentFence)`，再`getReleaseFences()`取回每个HWC layer的release fence。提交结束，但像素还没稳定，present fence继续跟踪。
 
 ## 第13步：present fence、release fence与buffer回收
 
@@ -1881,7 +2096,7 @@ void SurfaceFlinger::onCompositionPresented(PhysicalDisplayId pacesetterId,
 }
 ```
 
-`addPresentFence()`把fence挂到事务完成回调上，App的`TransactionCompletedListener`收到的`presentFence`就是它；`targeter->setPresentFence()`把fence交给Scheduler的FrameTarget，用于Vsync预测；`mScheduler->addPresentFence()`（3992）把fence喂给VsyncTracker。`mFrameTimeline->setSfPresent()`（3822）同时上报FrameTimeline。
+`addPresentFence()`把fence挂到事务完成回调上，App的`TransactionCompletedListener`收到的`presentFence`就是它；`targeter->setPresentFence()`把fence交给Scheduler的FrameTarget，用于Vsync预测；`mScheduler->addPresentFence()`（3992）把fence喂给VsyncTracker。`mFrameTimeline->setSfPresent()`（3822）同时上报FrameTimeline；`usesClientComposition`的display还会额外把`clientTargetAcquireFence`作为gpuCompositionDoneFence一起上报，用来区分“GPU画完”和“真正上屏”。
 
 ### 13.2 release fence的来源
 
@@ -1902,7 +2117,7 @@ sp<Fence> HWComposer::getLayerReleaseFence(HalDisplayId displayId, HWC2::Layer* 
 }
 ```
 
-注意：HWC的release fence描述“上一帧的buffer何时可复用”。HWC在present这一帧时才给出上一帧buffer的release fence。所以`presentFrameAndReleaseLayers()`拿到的是上一次present的layer release fence，用它释放上一帧的buffer。
+注意：HWC的release fence描述“上一帧的buffer何时可复用”，但它是在**本帧**present时才返回的。`presentFrameAndReleaseLayers()`拿到的是本次present的layer release fence，作用对象是上一帧的buffer——`Output.cpp`那里的注释写得很直白：“The layer buffer from the previous frame ... is released by HWC only when the release fence from this frame ... is signaled”。
 
 - client composition的acquire fence。本帧用了GPU合成时，client target buffer的acquire fence要并进layer的release fence（`Fence::merge("LayerRelease", releaseFence, frame.clientTargetAcquireFence)`）。因为layer的buffer被读进了client target，必须等client target的GPU工作完成。
 
@@ -1945,7 +2160,7 @@ void Layer::releasePendingBuffer(nsecs_t dequeueReadyTime) {
 
 ### 13.4 App端releaseBufferCallback与计数-1
 
-`BufferReleaseChannel`是App与SF之间的fd通道。`BLASTBufferQueue::createBufferQueue()`在1358行`open()`它并创建`BufferReleaseReader`（代码见6.2）。
+`BufferReleaseChannel`是App与SF之间的fd通道。`BLASTBufferQueue::createBufferQueue()`在1358行`open()`它并创建`BufferReleaseReader`。
 
 producer端通过单独的`updateBufferReleaseProducer()`（1453）注册到`SurfaceControl`：
 
@@ -1971,6 +2186,8 @@ bbq->drainBufferReleaseConsumer();
 
 ```cpp
 // BLASTBufferQueue.cpp:490（节选）
+const auto it = mSubmitted.find(id);
+const bool isEGL = it != mSubmitted.end() && it->second.mApi == NATIVE_WINDOW_API_EGL;
 if (currentMaxAcquiredBufferCount) {
     mCurrentMaxAcquiredBufferCount = *currentMaxAcquiredBufferCount;
 }
@@ -1993,7 +2210,7 @@ ATRACE_INT(mQueuedBufferTrace.c_str(), mNumFrameAvailable + mNumAcquired - mPend
 
 `releaseBuffer()`（540）先`mSubmitted.find(callbackId)`，找不到就直接返回；找到则`mNumAcquired--`、`mBufferItemConsumer->releaseBuffer(it->second, releaseFence)`、从`mSubmitted`和`mSyncedFrameNumbers`里删掉对应项。
 
-`mNumAcquired--`加`releaseBuffer()`把slot交还BufferQueue，`mDequeueCondition`被signal，第6步可能正在等待的`dequeueBuffer()`因此继续。`QueuedBuffer`计数在`ATRACE_INT`处下降，systrace上表现为向下的台阶。
+`mNumAcquired--`加`releaseBuffer()`把slot交还BufferQueue。对BLAST来说，`BBQBufferQueueCore::notifyBufferReleased()`被重写为`mBufferReleaseReader->interruptBlockingRead()`：写eventfd打断第6步正在`readBlocking()`里`epoll_wait()`的dequeue，而不是去notify `mDequeueCondition`。dequeue被唤醒后重新检查空闲slot，没有才继续等。`QueuedBuffer`计数在`ATRACE_INT`处下降，systrace上表现为向下的台阶。
 
 ### 13.5 present fence与release fence的区别
 
@@ -2001,7 +2218,7 @@ ATRACE_INT(mQueuedBufferTrace.c_str(), mNumFrameAvailable + mNumAcquired - mPend
 |---|---|---|
 |谁产生|HWC在present时产生|HWC为每个layer产生，或GPU合成完成fence，或present fence兜底|
 |回答什么|这一帧何时真正显示在屏幕上|这块buffer何时可被生产者重新写入|
-|谁等待|App的FrameCommitCallback、Scheduler的VsyncTracker、FrameTimeline|App的`dequeueBuffer()`、BufferQueueProducer|
+|谁等待|App的`TransactionCompletedListener`（`TransactionStats.presentFence`）、Scheduler的VsyncTracker、FrameTimeline|App的`dequeueBuffer()`（BLAST下阻塞在BufferReleaseChannel）、BufferQueueProducer|
 |signal条件|显示控制器完成这一帧的扫描输出|该layer的buffer不再被显示管线或GPU读取|
 |代码位置|`HWComposer::getPresentFence()`、`FrameTimeline::setSfPresent()`|`HWComposer::getLayerReleaseFence()`、`LayerFE::setReleaseFence()`、`releaseBufferCallback()`|
 
@@ -2011,9 +2228,58 @@ present fence signal了不代表buffer立刻可复用：如果HWC还在读它（
 
 一帧可以按四个阶段看：
 
-- App侧（步骤1-5）：`scheduleTraversals()`合并脏区域并通过`postVsyncCallback(CALLBACK_TRAVERSAL, mTraversalCallback)`申请`VSYNC-app`；`doFrame()`依次跑INPUT、ANIMATION、INSETS_ANIMATION、TRAVERSAL、COMMIT；TRAVERSAL里完成measure/layout并把DisplayList录进RenderNode，`syncAndDrawFrame()`把树交给RenderThread，`prepareTree()`同步属性后`unblockUiThread()`放行UI线程。
-- GPU侧（步骤6-8）：`eglBeginFrame`从BLAST BufferQueue dequeue（可能阻塞在BufferReleaseChannel），Skia把RenderNode树翻译成GPU命令并`FlushAndSubmit()`，`eglSwapBuffersWithDamageKHR()`把buffer连同GPU完成fence交给`Surface::queueBuffer()`，`QueuedBuffer`+1。
-- 提交侧（步骤9-11）：`onFrameAvailable()`→`acquireNextBufferLocked()`→`Transaction::setBuffer().apply()`，事务到达SF，`BufferTX`+1；`VSYNC-sf`回调触发`Scheduler::onFrameSignal()`，`commit()`latch buffer并选刷新率，`gatherBufferInfo()`使`BufferTX`-1。
-- 合成与回收（步骤12-13）：`composite()`→`Output::present()`→HWC`validate()`决定device/client合成→`presentDisplay()`；`onCompositionPresented()`把present fence喂给FrameTimeline和Scheduler，`releasePendingBuffer()`把上一帧release fence写入`BufferReleaseChannel`，App端`releaseBufferCallback()`收buffer，`QueuedBuffer`-1。
+- App侧（步骤1-5）：`scheduleTraversals()`申请`VSYNC-app`（硬件加速下`invalidate()`只整窗标脏，不合并矩形），`doFrame()`依次跑INPUT、ANIMATION、INSETS_ANIMATION、TRAVERSAL、COMMIT；TRAVERSAL里完成measure/layout并把DisplayList录进RenderNode，`syncAndDrawFrame()`把树交给RenderThread，`prepareTree()`同步属性后`unblockUiThread()`放行UI线程（只看`prepareTextures`，不看本帧是否会被丢）。
+- GPU侧（步骤6-8）：EGL驱动在`eglBeginFrame`阶段发起dequeue，经`ReliableSurface`拦截后进`Surface::dequeueBuffer`（可能阻塞在BufferReleaseChannel）；Skia把RenderNode树翻译成GPU命令并`FlushAndSubmit()`，`eglSwapBuffersWithDamageKHR()`把buffer连同GPU完成fence交给`Surface::queueBuffer()`，`QueuedBuffer`+1。`queueBuffer()`可能等上一帧的GPU fence（EGL限流，最多两个buffer在途）。
+- 提交侧（步骤9-11）：`onFrameAvailable()`→`acquireNextBufferLocked()`→`Transaction::setBuffer().apply()`，事务到达SF，`BufferTX`+1；`VSYNC-sf`回调触发`Scheduler::onFrameSignal()`，`commit()`把事务应用进`mDrawingState`并由`latchBufferImpl()`提交到`mBufferInfo`、选刷新率，`gatherBufferInfo()`使`BufferTX`-1。
+- 合成与回收（步骤12-13）：`composite()`→`Output::present()`→HWC`validate()`决定device/client合成→`presentFrame()`；`onCompositionPresented()`把present fence喂给FrameTimeline和Scheduler，`releasePendingBuffer()`把上一帧release fence写入`BufferReleaseChannel`，App端`releaseBufferCallback()`收buffer，`QueuedBuffer`-1。
 
 present fence决定“这一帧何时算显示完成”，release fence决定“这块buffer何时能再次被App使用”，两者共同构成buffer从dequeue到release的完整生命周期。
+
+## 附录A：执行体速查
+
+|执行体|所在进程|这一帧里干什么|
+|---|---|---|
+|App主线程|App|`doFrame()`各阶段、measure/layout、把DisplayList录进RenderNode、调`syncAndDrawFrame()`后阻塞在`postAndWait()`|
+|RenderThread|App|`prepareTree()`同步树状态、dequeue、Skia回放DisplayList、`FlushAndSubmit()`、`swapBuffers()`/`queueBuffer()`；BLAST的`onFrameAvailable()`/`acquireNextBufferLocked()`也在这条线程上同步执行|
+|App Binder线程|App|`TransactionCompletedListener`收SF的事务完成回调、present fence|
+|SF Binder线程|surfaceflinger|`setTransactionState()`：sanitize、解析事务、`BufferTX`+1、入无锁队列、`setTransactionFlags()`|
+|VSyncDispatch定时器线程|surfaceflinger|`EventThread::onVsync()`（app）、`MessageQueue::vsyncCallback()`（sf）；`timerCallback()`在锁外回调entry|
+|EventThread线程|surfaceflinger|`dispatchEvent()`把Vsync事件写进各连接的`BitTube`|
+|SF主线程|surfaceflinger|`onFrameSignal()`→`commit()`→`composite()`→`present()`→`onCompositionPresented()`，以及`releasePendingBuffer()`|
+|HWC/composer|vendor HAL|`validate()`/`presentOrValidate()`/`present()`，产出present fence与每层release fence；`mOffloadPresent`时present可投给`HwcAsyncWorker`|
+|显示控制器|硬件|按vsync扫描输出，present fence在此时signal|
+
+## 附录B：丢帧与背压速查
+
+App侧：
+
+- `syncFrameState()`把丢帧原因写进`SkippedFrameReason`：`NoOutputTarget`、`ContextIsStopped`、`AlreadyDrawn`（同一vsync画过）、`NothingToDraw`（backdrop不可绘制）、`NoBuffer`（`reserveNext()`失败）。`run()`据`skippedFrameReason`决定跳过`draw()`，只`flushAndSubmit()`+`waitOnFences()`；同时置`SyncResult::FrameDropped`回传给UI线程。注意A17里`DISABLE_BUFFER_PREFETCH = true`，`reserveNext()`直接返回OK，`NoBuffer`实际不可达。
+- jitter超过一个帧间隔：对齐帧时间并打印`Skipped N frames!`；帧时间倒退：`scheduleVsyncLocked()`等下一帧；`mFPSDivisor > 1`：按分频跳过。
+- buffer stuffing：dequeue阻塞超过半帧→`Choreographer.onWaitForBufferRelease()`置位→下一次`doFrame()`返回`DELAY_FRAME`主动推迟一帧；恢复期用`OFFSET`回拨动画时间轴。
+
+系统侧：
+
+- SF的HWC背压：`FrameTarget::wouldBackpressureHwc()`为真且需要GPU合成或错过HWC帧时，`VsyncTracker::onFrameMissed()`后带slack重新`scheduleCommit()`，本帧`commit()`返回false。
+- follower display背压：`follower_display_backpressure_combined`开启时，非lockstep的follower有未完成present fence就把该follower从本帧targets排除，pacesetter照常合成。
+- `commit()`返回false（`mustComposite == false`或`BOOTLOADER`阶段）：不进入composite，屏幕内容不变。
+- BLAST容量：`mNumAcquired >= mMaxAcquiredBuffers + 2`时`acquireNextBufferLocked()`返回`NO_BUFFER_AVAILABLE`；普通路径不等待，帧留在影子队列等release回调再acquire；sync事务路径才在`mCallbackCV`上等。
+- EGL限流：`BufferQueueProducer::queueBuffer()`默认等上一帧GPU fence，最多两个buffer在途，第三个要等。
+- `ReliableSurface`兜底：真实dequeue失败时返回1x1 scratch buffer，本帧画进假buffer并在queue时丢弃，`getAndClearError()`可读到错误码。
+
+## 附录C：Perfetto/systrace观察点
+
+|计数/切片|产生位置|含义|
+|---|---|---|
+|`VSYNC-app`|`EventThread.cpp`的`mVsyncTracer`|App侧vsync翻转，每次`EventThread::onVsync()`一次|
+|`VSYNC-sf`|`MessageQueue.h`的`TracedOrdinal<int> value`|SF侧vsync翻转，`MessageQueue::vsyncCallback()`里取反|
+|`Choreographer#doFrame <vsyncId>`|`Choreographer.doFrame()`|一帧App回调的开始；resynced时会额外带`resynced to ...`|
+|`input`/`animation`/`insets_animation`/`traversal`/`commit`|`Choreographer.doCallbacks()`|各阶段回调耗时|
+|`DrawFrames <vsyncId>`、`syncFrameState`、`prepareTree`|HWUI的ATRACE|UI→RT同步与树状态准备|
+|`dequeueBuffer - <surface>`、`queueBuffer`|`Surface.cpp`|buffer进出生产者|
+|`QueuedBuffer - VRIBLAST#N`|`BLASTBufferQueue`的`mQueuedBufferTrace`|App已queue、尚未被SF释放的buffer数（`mNumFrameAvailable + mNumAcquired - mPendingRelease.size()`）|
+|`BufferTX - <layer>`|`BufferCountTracker`|已到达SF但未latch的buffer数|
+|`PendingRelease`|`BLASTBufferQueue::releaseBufferCallbackLocked()`|被暂留、还没真正release的buffer数|
+|`Vsync-Early`/`Vsync-EarlyGpu`/`Vsync-Late`|`VsyncModulator::updateVsyncConfigLocked()`|当前生效的Vsync配置类型|
+|`EarlyWakeupRequests`|`VsyncModulator`|在途的early wakeup请求数|
+
+观察顺序建议：先看`VSYNC-app`→`Choreographer#doFrame`是否对齐，再看`DrawFrame`/`dequeueBuffer`有没有长阻塞，然后看`QueueBuffer`与`BufferTX`是否在`VSYNC-sf`前到位，最后用present fence确认上屏时刻。
