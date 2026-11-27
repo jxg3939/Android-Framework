@@ -142,7 +142,7 @@ Choreographer侧还有第二道同样的标记：`doFrame()`在进入各阶段�
 
 ### 2.1 从postVsyncCallback到申请Vsync
 
-`postCallbackDelayedInternal()`把回调按`dueTime`插进`mCallbackQueues[callbackType]`；`dueTime <= now`时立刻`scheduleFrameLocked(now)`，否则投一条异步`MSG_DO_SCHEDULE_CALLBACK`。
+`postCallbackDelayedInternal()`把回调按`dueTime`插进`mCallbackQueues[callbackType]`；`dueTime <= now`时立刻`scheduleFrameLocked(now)`，否则投一条异步`MSG_DO_SCHEDULE_CALLBACK`
 
 `postVsyncCallback(int callbackType, VsyncCallback callback)`只是把token换成`VSYNC_CALLBACK_TOKEN`再转调：
 
@@ -666,7 +666,7 @@ void DrawFrameTask::postAndWait() {
 - 同步点：`syncFrameState()`返回，RenderThread已接走树状态快照和DisplayList引用，`unblockUiThread()`唤醒UI线程；纹理未备齐时这次同步会推迟到`draw()`之后。
 - 同步点后：UI线程可以修改View树，RenderThread继续`context->draw()`。
 
-所以UI线程与RenderThread的同步边界是等到树状态已被RenderThread接走。
+所以UI线程与RenderThread的同步边界是等到RenderNode树状态已被RenderThread接走。
 
 ## 第5步：RenderThread同步树状态
 
@@ -814,7 +814,9 @@ void RenderNode::prepareTree(TreeInfo& info) {
 
 ![alt text](image-5.png)
 
-### 6.1 draw()到getFrame()
+### 6.1 从draw()到dequeue
+
+第5步结束时，`CanvasContext::draw()`已经确定这一帧要画。但在下发第一条绘制命令之前，它必须先拿到一块可写的 buffer：算完damage、标记`IssueDrawCommandsStart`，然后调`getFrame()`。
 
 ```cpp
 void CanvasContext::draw(bool solelyTextureViewUpdates) {
@@ -832,7 +834,7 @@ void CanvasContext::draw(bool solelyTextureViewUpdates) {
 }
 ```
 
-`CanvasContext::draw()`在算完脏区域后调用`getFrame()`；`getFrame()`若有`mHardwareBuffer`就直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。以Skia的OpenGL管线`SkiaOpenGLPipeline`为例，它的`getFrame()`只把`mEglSurface`交给`mEglManager.beginFrame()`。
+`getFrame()`有`mHardwareBuffer`时直接返回逻辑尺寸，否则转给`mRenderPipeline->getFrame()`。以`SkiaOpenGLPipeline`为例，它只是把`mEglSurface`交给`EglManager::beginFrame()`；`beginFrame()`做的是`makeCurrent()`、查询surface尺寸和bufferAge，为后续绘制准备EGL环境：
 
 ```cpp
 // frameworks/base/libs/hwui/renderthread/EglManager.cpp
@@ -849,7 +851,16 @@ Frame EglManager::beginFrame(EGLSurface surface) {
 }
 ```
 
-`eglBeginFrame()`在AOSP的EGL loader里只做转发：`eglApi.cpp`调`cnx->platform.eglBeginFrame()`，平台默认实现`egl_platform_entries.cpp:903`只校验display/surface。真正发起dequeue的是EGL驱动——它在需要back buffer时通过`ANativeWindow`函数表调`dequeueBuffer`，所以AOSP里能断言的调用栈从`Surface::hook_dequeueBuffer`开始：
+注意`beginFrame()`这一步并没有dequeue。`eglBeginFrame()`在AOSP的EGL loader里只做转发：`eglApi.cpp`调`cnx->platform.eglBeginFrame()`，平台默认实现（`egl_platform_entries.cpp:903`）只校验display/surface。真正发起dequeue的是EGL驱动——它在需要back buffer时通过`ANativeWindow`的函数表调`dequeueBuffer`：
+
+```cpp
+// frameworks/native/libs/nativewindow/ANativeWindow.cpp
+int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd) {
+    return window->dequeueBuffer(window, buffer, fenceFd);
+}
+```
+
+从这里到拿到buffer是一条固定调用链：
 
 ```text
 EGL驱动 -> ANativeWindow_dequeueBuffer(window, &buf, &fence)
@@ -861,22 +872,11 @@ EGL驱动 -> ANativeWindow_dequeueBuffer(window, &buf, &fence)
                       -> BufferQueueProducer::dequeueBuffer
 ```
 
-`ANativeWindow_dequeueBuffer()`只是查函数表：
+`ANativeWindow_dequeueBuffer()`只是查函数表。链上的每一层各有分工：Surface负责拦截器和参数转换，HWUI的`ReliableSurface`负责兜底，`BufferQueueProducer`负责真正找slot或等待。dequeue的具体时机（beginFrame、首次绘制或swap）由驱动决定，AOSP不保证，但无论何时都会先经过HWUI的拦截器。下面按这条链逐层看。
 
-```cpp
-// frameworks/native/libs/nativewindow/ANativeWindow.cpp
-int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd) {
-    return window->dequeueBuffer(window, buffer, fenceFd);
-}
-```
+### 6.2 dequeueBuffer的调用链
 
-dequeue发生的具体时机（beginFrame、首次绘制或swap）由驱动决定，AOSP不保证；但无论何时，都会先撞上HWUI装的拦截器。
-
-### 6.2 dequeueBuffer
-
-HWUI并不直接把`Surface`交给EGL：`CanvasContext`用`ReliableSurface`包了一层，`ReliableSurface::init()`通过`ANativeWindow_setDequeueBufferInterceptor()`把`ReliableSurface::hook_dequeueBuffer`注册到Surface上。EGL驱动调`ANativeWindow_dequeueBuffer`时先进入`Surface::hook_dequeueBuffer`，它把请求转给已注册的拦截器；拦截器再回调`Surface::dequeueBufferInternal`走正常路径。
-
-`Surface::hook_dequeueBuffer()`是通用的拦截器入口：
+链上的第一层是`Surface::hook_dequeueBuffer()`：`ANativeWindow`的函数指针指向它，它的职责是分发——看有没有注册拦截器；有就带上正常路径的函数指针`Surface::dequeueBufferInternal`一起转给拦截器，没有就直接走`Surface::dequeueBuffer()`。
 
 ```cpp
 // frameworks/native/libs/gui/Surface.cpp
@@ -899,7 +899,7 @@ int Surface::hook_dequeueBuffer(ANativeWindow* window,
 }
 ```
 
-对HWUI来说，这个拦截器就是`ReliableSurface`：正常路径先看有没有预取好的`mReservedBuffer`（有就直接给），没有才调`dequeueBufferInternal`；真实dequeue失败时它返回一块1x1的scratch buffer把本帧糊弄过去，`queueBuffer`时再识别出来丢掉，避免整个surface被判定为损坏。A17里buffer预取被`constexpr bool DISABLE_BUFFER_PREFETCH = true`关掉，所以正常情况下dequeue就发生在第6步。
+HWUI注册的拦截器是`ReliableSurface`：`CanvasContext::setSurface()`用`std::make_unique<ReliableSurface>(window)`把Surface包一层，`init()`里通过`ANativeWindow_setDequeueBufferInterceptor()`把`ReliableSurface::hook_dequeueBuffer`注册上去。它干两件事：预取命中时直接交出预留的buffer；真实dequeue失败时返回一块1x1的scratch buffer兜底，让本帧“画个假的”，queue时再丢弃，避免整个surface被判定为损坏。A17里buffer预取被`constexpr bool DISABLE_BUFFER_PREFETCH = true`关掉，所以预取分支基本不生效，正常情况下直接走真实dequeue，失败时才用这块兜底buffer。
 
 ```cpp
 // frameworks/base/libs/hwui/renderthread/ReliableSurface.cpp（节选）
@@ -925,7 +925,7 @@ int ReliableSurface::hook_dequeueBuffer(ANativeWindow* window,
 }
 ```
 
-拦截器中正常走到`dequeueBufferInternal`：
+拦截器内部调用的就是`Surface::dequeueBufferInternal()`：它调`Surface::dequeueBuffer()`拿到`sp<GraphicBuffer>`，再以`ANativeWindowBuffer*`的形式返回给拦截器。
 
 ```cpp
 int Surface::dequeueBufferInternal(ANativeWindow* window, ANativeWindowBuffer** buffer,
@@ -939,9 +939,10 @@ int Surface::dequeueBufferInternal(ANativeWindow* window, ANativeWindowBuffer** 
 }
 ```
 
-走拦截器也就是多一步调用，最终还是落到`Surface::dequeueBuffer`
+`Surface::dequeueBuffer()`把请求转给`mGraphicBufferProducer`：
 
 ```cpp
+// frameworks/native/libs/gui/Surface.cpp
 int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
     {
         std::scoped_lock _dl(mDebugMutex);
@@ -959,7 +960,7 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
 }
 ```
 
-`BBQBufferQueueProducer`没有重写`dequeueBuffer`，调用`BufferQueueProducer`的`dequeueBuffer`：
+`mGraphicBufferProducer`在BLAST下指向本进程的`BBQBufferQueueProducer`。这个类只重写了`connect()`、`waitForBufferRelease()`等少数方法，没有重写`dequeueBuffer()`，所以请求直接进`BufferQueueProducer::dequeueBuffer()`：
 
 ```cpp
 status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* outFence,
@@ -968,19 +969,55 @@ status_t BufferQueueProducer::dequeueBuffer(int* outSlot, sp<android::Fence>* ou
                                             FrameEventHistoryDelta* outTimestamps) {
     ATRACE_CALL();
     ...
-    // 循环：waitForFreeSlotThenRelock + 必要时分配GraphicBuffer
+    int found = BufferItem::INVALID_BUFFER_SLOT;
+    while (found == BufferItem::INVALID_BUFFER_SLOT) {
+        status_t status = waitForFreeSlotThenRelock(FreeSlotCaller::Dequeue, lock, &found);
+        if (status != NO_ERROR) {
+            return status;
+        }
+        ...
+    }
+    ...
+    *outSlot = found;
+    ...
     mSlots[found].mBufferState.dequeue();
+    ...
+    *outFence = mSlots[found].mFence;
     ...
     addAndGetFrameTimestamps(nullptr, outTimestamps);
     return returnFlags;   // 可能是 OK、WOULD_BLOCK 或 TIMED_OUT
 }
 ```
 
+`BufferQueueProducer::dequeueBuffer()`先做参数检查，然后在这个 while 里反复调`waitForFreeSlotThenRelock()`找slot；找到后用`*outSlot`把slot号交出去。注意`mSlots[found].mBufferState.dequeue()`并不是“拿到buffer”，它只是状态记账：把这块slot从FREE迁到DEQUEUED（A17里是`mDequeueCount++`），表示slot归生产者所有，消费者不能再动它。真正的buffer本体是`mSlots[found].mGraphicBuffer`，可能为空；为空或属性不匹配时`returnFlags`会带`BUFFER_NEEDS_REALLOCATION`，由调用方`Surface::dequeueBuffer()`再`requestBuffer()`取回。最后返回给上层的还有`*outFence`（这块buffer上一轮使用者的fence）和`returnFlags`。
+
+找不到空闲slot时，它会停在`waitForFreeSlotThenRelock()`里等待，具体见6.3。
+
 ### 6.3 什么时候会在这里等待
 
-`dequeueBuffer()`在`waitForFreeSlotThenRelock()`里拿不到空闲slot时调`waitForBufferRelease()`。先要区分两种情形：普通BufferQueue里若producer与consumer都由App控制、又没有显式设dequeue timeout，`mDequeueBufferCannotBlock`为true，函数会返回`WOULD_BLOCK`而不是死等；BLAST在`initialize()`里把timeout设成`int64_t`最大值，所以一定走阻塞等待。
+等待的调用关系是`dequeueBuffer()` → `waitForFreeSlotThenRelock()` → `waitForBufferRelease()`，等待发生在`waitForFreeSlotThenRelock()`的循环尾部：找不到空闲slot（或队列里buffer太多）时，它先判断能不能不阻塞，不能就调`waitForBufferRelease()`：
 
-`BufferQueueProducer`的默认实现等`mDequeueCondition`：
+```cpp
+// frameworks/native/libs/gui/BufferQueueProducer.cpp（节选：waitForFreeSlotThenRelock() 的循环尾部）
+...
+tryAgain = (*found == BufferQueueCore::INVALID_BUFFER_SLOT) ||
+           tooManyBuffers;
+if (tryAgain) {
+    // 非阻塞模式直接返回，不在这里等
+    if ((mCore->mDequeueBufferCannotBlock || mCore->mAsyncMode) &&
+            (acquiredCount <= mCore->mMaxAcquiredBufferCount)) {
+        return WOULD_BLOCK;
+    }
+    if (status_t status = waitForBufferRelease(lock, mDequeueTimeout);
+        status == TIMED_OUT) {
+        return TIMED_OUT;
+    }
+}
+```
+
+上面这段就是等待的入口，但真正会不会阻塞还取决于配置：普通BufferQueue里若producer与consumer都由App控制、又没有显式设dequeue timeout，`mDequeueBufferCannotBlock`为true，`dequeueBuffer()`直接返回`WOULD_BLOCK`；BLAST在`initialize()`里把timeout设成`int64_t`最大值，所以一定走阻塞等待。
+
+确定要等之后，具体怎么等由`waitForBufferRelease()`的两个实现决定。普通BufferQueue等`mDequeueCondition`：
 
 ```cpp
 // frameworks/native/libs/gui/BufferQueueProducer.cpp
@@ -1016,11 +1053,13 @@ status_t waitForBufferRelease(std::unique_lock<std::mutex>& bufferQueueLock,
 }
 ```
 
-`mBufferReleaseReader`读`BufferReleaseChannel`（epoll监听一个eventfd），SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`的`epoll_wait()`上，channel有数据后eventfd被写、epoll返回，`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。`BLASTBufferQueue::initialize()`把dequeue timeout设为最大值，默认无限等待。
+`mBufferReleaseReader`读`BufferReleaseChannel`（epoll监听一个eventfd），SurfaceFlinger释放buffer时往channel写release信息（第13步）。所以“释放后才有空闲slot”在这里是显式的：dequeue阻塞在`readBlocking()`的`epoll_wait()`上，channel有数据后eventfd被写、epoll返回，`releaseBufferCallback()`把slot还给队列，`BufferQueueProducer`重新检查空闲slot，dequeue才返回。
 
 `waitForBufferRelease()`在返回前还会调`getWaitForBufferReleaseCallback()`，把“这次阻塞了多久”报给Choreographer：超过半帧就置位buffer stuffing，下一次`doFrame()`主动`DELAY_FRAME`一帧（见2.4）。所以第6步的阻塞和App侧的丢帧策略是连动的。
 
 ### 6.4 本步拿到的两样关键东西
+
+等slot找到、`Surface::dequeueBuffer()`把buffer取回，本步就拿到两样东西：
 
 - 一个空闲slot对应的`GraphicBuffer`。
 - 该buffer从消费者侧继承的release fence（`fenceFd`）。EGL开始往这块buffer画之前必须等它，保证上一轮使用者已读完。
@@ -1051,6 +1090,8 @@ void CanvasContext::draw(bool solelyTextureViewUpdates) {
     ...
 }
 ```
+
+注意`waitOnFences()`等的不是GPU fence，也不是BufferQueue的acquire/release fence，而是`mFrameFences`里的一批`std::future<void>`：`DrawFrameTask::run()`会把UI线程注册的`FrameDrawingCallback`通过`enqueueFrameWork()`投到`CommonPool`上执行，future存进`mFrameFences`；`waitOnFences()`在这里逐个`get()`，确保这些回调（比如按frameNumber合并事务、注册`FrameCommitCallback`）在`swapBuffers()`把buffer交给BufferQueue之前完成。所以它等的是CPU侧的异步回调，不是等GPU画完。
 
 此处`mRenderPipeline`参考`SkiaOpenGLPipeline`
 
@@ -1545,7 +1586,7 @@ name为`const std::string mBlastTransactionName{"BufferTX - " + mName};`，`Buff
 
 ## 第10步：Vsync-sf定时器唤醒SurfaceFlinger
 
-第9步停在这样一个状态：`apply()`已在App进程返回，带buffer的`Transaction`躺进了SF的待处理事务队列，`BufferTX - <layerName>`+1，而`Layer::mDrawingState.buffer`还是上一帧的buffer。
+第9步停在这样一个状态：`apply()`已在App进程返回，带buffer的`Transaction`进了SF的待处理事务队列，`BufferTX - <layerName>`+1，而`Layer::mDrawingState.buffer`还是上一帧的buffer。
 
 ### 10.1 排唤醒：从scheduleCommit到scheduleFrame
 
@@ -1580,7 +1621,6 @@ void MessageQueue::scheduleFrame(Duration workDurationSlack) {
 
 `mVsync.registration`是`VSyncCallbackRegistration`，在`onNewVsyncScheduleLocked()`里创建，绑定的回调是`vsyncCallback`，名字叫`"sf"`。
 SF中`VSyncCallbackRegistration`的来历参考[mScheduler->initVsync](../Scheduler相关/Scheduler.md#initVsync)；
-SF中`VSyncCallbackRegistration::schedule`参考[schedule](../VsyncSchedule相关/VsyncSchedule.md#VSyncCallbackRegistration::schedule)。
 
 ### 10.2 workDuration、readyDuration与VsyncModulator
 
@@ -1609,9 +1649,9 @@ void Scheduler::setVsyncConfig(const VsyncConfig& config) {
 带两个参数的`setDuration()`给App的`EventThread`，带一个参数的给SF自己的`MessageQueue`。于是同一条Vsync时间轴被切成两段：
 
 ```text
-        App 唤醒                 App deadline / SF 唤醒             vsync
-  ----------|----------------------------|---------------------------|---->
-   vsync-(appWorkDuration+sfWorkDuration)  vsync - sfWorkDuration     vsync
+        App 唤醒                                App deadline / SF 唤醒              vsync
+  ----------|------------------------------------------|----------------------------|---->
+   vsync-(appWorkDuration+sfWorkDuration)         vsync - sfWorkDuration           vsync
 ```
 
 - App：`workDuration = appWorkDuration`、`readyDuration = sfWorkDuration`，即“提前`appWorkDuration + sfWorkDuration`醒，可用工作窗口是`appWorkDuration`，最晚在`vsync - sfWorkDuration`前把buffer交出去”。
